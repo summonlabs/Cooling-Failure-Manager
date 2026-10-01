@@ -127,7 +127,16 @@ struct VerifyFinding {
 struct VerifyOptions {
   /// Re-read and re-validate every retained generation file, not just the head.
   bool deep = true;
-  /// Check accepted-attempt records for shape and digest agreement.
+  /// Check the replay index the committed manifest carries, and the
+  /// accepted-attempt records an earlier release wrote as files of their own, for
+  /// shape and agreement with the entries that carry them.
+  ///
+  /// The replay index is part of the authority: a publication records its own
+  /// accepted attempt inside the manifest that commits it, so the mutation and the
+  /// identity that makes its retry a replay cross the commit point together. A
+  /// retry carrying an identity the index still holds is answered with the
+  /// committed result before any epoch, incarnation, generation or binding fence
+  /// is judged, and publishes nothing.
   bool verify_idempotency = true;
   /// Re-encode every decoded payload and compare (canonical fixed point check).
   bool verify_canonical_fixed_point = true;

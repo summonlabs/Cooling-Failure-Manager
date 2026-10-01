@@ -47,7 +47,16 @@
 //    direction implemented here, which is the only one under which the
 //    documented "a base generation below the head is accepted as a new mutation"
 //    behaviour can hold.
-//  * A failure AFTER the commit point (floor, attempt record, retirement) cannot
+//  * The accepted-attempt record of a publication is carried inside the retained
+//    manifest entry that commits it, so the mutation and the identity that makes
+//    its retry a replay become durable at the same instant, by the same single
+//    atomic replacement. There is no longer any step after the commit point that
+//    writes replay bookkeeping, and therefore no crash boundary at which a
+//    mutation is committed while a retry of it would be mistaken for a new
+//    mutation. The replay window is the newest min(retained_generations,
+//    idempotency_retention) entries of the committed manifest, recorded in the
+//    manifest itself; see docs/FORMATS.md section 2.2.
+//  * A failure AFTER the commit point (the floor, retirement, cleanup) cannot
 //    un-commit the head. It downgrades durability to NotDurable and is reported
 //    through verify(); it never turns a committed publication into a failed
 //    call, because that would invite a retry that publishes a second generation
@@ -107,10 +116,12 @@ constexpr const char* kQuarantineDirectoryName = "quarantine";
 ///   publish.before-rename    the staged file was read back and verified
 ///   publish.after-rename     the generation file is in generations/
 ///   publish.before-manifest  manifest.prev is durable, the head is not committed
-///   publish.after-manifest   the head manifest was replaced: the commit point
+///   publish.before-commit-entry  the head record is durable beside its target, not committed
+///   publish.after-commit-entry   the head record was replaced: the commit point
+///   publish.after-manifest   the in-memory head moved onto the committed record
 ///   publish.before-floor     the in-memory head moved, the floor is not written
 ///   publish.after-floor      the durable floor advanced
-///   publish.after-idem       the accepted-attempt record is durable
+///   publish.after-commit     the whole publication is committed; nothing else is written
 ///   publish.after-retire     retirement and staging cleanup finished
 constexpr const char* kFaultOpenAfterLock = "open.after-lock";
 constexpr const char* kFaultOpenAfterReserve = "open.after-reserve";
@@ -122,7 +133,9 @@ constexpr const char* kFaultPublishBeforeManifest = "publish.before-manifest";
 constexpr const char* kFaultPublishAfterManifest = "publish.after-manifest";
 constexpr const char* kFaultPublishBeforeFloor = "publish.before-floor";
 constexpr const char* kFaultPublishAfterFloor = "publish.after-floor";
-constexpr const char* kFaultPublishAfterIdem = "publish.after-idem";
+constexpr const char* kFaultPublishBeforeCommitEntry = "publish.before-commit-entry";
+constexpr const char* kFaultPublishAfterCommitEntry = "publish.after-commit-entry";
+constexpr const char* kFaultPublishAfterCommit = "publish.after-commit";
 constexpr const char* kFaultPublishAfterRetire = "publish.after-retire";
 
 std::string join(const std::string& root, std::string_view name) {
@@ -159,6 +172,8 @@ constexpr std::string_view kFindingUnexpectedEntry = "store.entry.unexpected";
 constexpr std::string_view kFindingQuarantine = "quarantine.present";
 constexpr std::string_view kFindingAttemptUnresolved = "attempt.unresolved";
 constexpr std::string_view kFindingIdempotencyUnreadable = "idempotency.unreadable";
+constexpr std::string_view kFindingReplayDuplicate = "replay.duplicate";
+constexpr std::string_view kFindingReplayInconsistent = "replay.inconsistent";
 
 /// True when a directory entry name is one of this store's own staged names. A
 /// staged name is derived from its target name and always ends in ".staged", so
@@ -414,12 +429,27 @@ struct Store::Impl {
 
   /// Durably writes the head record through a staging file and an atomic
   /// replacement. This is the commit point of a publication.
-  Result<void> write_manifest(const internal::Manifest& value, bool durable) {
+  /// Replaces the head manifest. When the caller is publishing a mutation, the
+  /// two boundaries that bracket the commit are distinct fault stages, because
+  /// the invariant this store guarantees is decided exactly between them: the
+  /// replacement is one atomic directory-entry operation, so the head record is
+  /// either entirely the previous publication or entirely the new one, and the
+  /// replay record of the new publication is inside it either way. Reserving the
+  /// writer epoch on open and committing a recovery also replace the manifest,
+  /// but neither is the commit point of a mutation, so neither is instrumented.
+  Result<void> write_manifest(const internal::Manifest& value, bool durable,
+                              bool is_publication_commit) {
     const std::string content = internal::encode_manifest(value);
     if (content.size() > limits::kMaxManifestBytes) {
       return Error(ErrorCode::LimitExceeded, "manifest exceeds the documented bound");
     }
+    if (is_publication_commit) {
+      internal::fault_point(options.enable_fault_injection, kFaultPublishBeforeCommitEntry);
+    }
     CFM_TRYV(publish_content(manifest_path(), content, limits::kMaxManifestBytes, durable));
+    if (is_publication_commit) {
+      internal::fault_point(options.enable_fault_injection, kFaultPublishAfterCommitEntry);
+    }
     return ok();
   }
 
@@ -436,20 +466,8 @@ struct Store::Impl {
     return ok();
   }
 
-  /// Writes one attempt record atomically: staged in staging/, read back, then
-  /// renamed into place, so a reader can never observe a half-written record.
-  Result<void> write_record_atomically(const std::string& target, std::string_view content,
-                                       bool durable) {
-    CFM_TRYV(publish_content(target, content, limits::kMaxIdempotencyRecordBytes, durable));
-    return ok();
-  }
-
   std::string generation_path(StateGeneration generation) const {
     return join(generations_path, internal::generation_file_name(generation));
-  }
-
-  std::string idempotency_path_of(const MutationId& mutation, const AttemptOrdinal& attempt) const {
-    return join(idempotency_path, internal::attempt_file_name(mutation, attempt));
   }
 
   /// Reads, verifies and decodes one generation file for a named store. Every
@@ -606,14 +624,29 @@ struct Store::Impl {
     return receipt;
   }
 
-  /// True when an accepted-attempt record for the same mutation but a strictly
-  /// higher ordinal exists. Attempt ordinals are 1-based and must not go
-  /// backwards: an ordinal below an accepted one is a reused identity, never a
-  /// new attempt.
-  Result<bool> has_accepted_newer_ordinal(const MutationId& mutation,
-                                          const AttemptOrdinal& attempt) const {
+  /// The accepted-attempt records the committed authority carries for one
+  /// mutation identity, newest first. The table holds at most one record per
+  /// identity, so this holds at most one.
+  std::vector<internal::AttemptRecord> manifest_attempts_for(const MutationId& mutation) const {
+    std::vector<internal::AttemptRecord> found;
+    for (const internal::AttemptRecord& record : manifest.attempts) {
+      if (record.mutation == mutation) {
+        found.push_back(record);
+      }
+    }
+    return found;
+  }
+
+  /// The accepted-attempt files of a store written by release 1.0.0, for one
+  /// mutation identity, ordered by the file name so the answer never depends on
+  /// directory enumeration order.
+  Result<std::vector<internal::AttemptRecord>> legacy_attempts_for(
+      const MutationId& mutation) const {
+    std::vector<internal::AttemptRecord> found;
     CFM_TRY(names, internal::list_directory(idempotency_path));
-    for (const std::string& name : names) {
+    std::vector<std::string> ordered(names.begin(), names.end());
+    std::sort(ordered.begin(), ordered.end());
+    for (const std::string& name : ordered) {
       const auto bytes =
           internal::read_file(join(idempotency_path, name), limits::kMaxIdempotencyRecordBytes);
       if (!bytes.has_value()) {
@@ -623,7 +656,64 @@ struct Store::Impl {
       if (!record.has_value()) {
         continue;
       }
-      if (record.value().mutation == mutation && attempt < record.value().ordinal) {
+      if (record.value().mutation == mutation) {
+        found.push_back(record.value());
+      }
+    }
+    return found;
+  }
+
+  /// The accepted-attempt record the committed authority carries for one
+  /// identity, or a record whose mutation is empty when this store holds none.
+  ///
+  /// The manifest is the authority: it is where a publication records its own
+  /// replay identity, so a mutation that crossed the commit point is found here
+  /// however the process died afterwards. The accepted-attempt files of release
+  /// 1.0.0 are consulted after it, for an identity the manifest does not carry at
+  /// all. They are never consulted for an identity the manifest does carry, so an
+  /// upgraded store is never answered from a superseded record, and a store that
+  /// has not published since the upgrade is answered from the files alone.
+  Result<internal::AttemptRecord> find_accepted_attempt(const MutationId& mutation,
+                                                        const AttemptOrdinal& attempt) const {
+    for (const internal::AttemptRecord& record : manifest_attempts_for(mutation)) {
+      if (record.ordinal == attempt) {
+        return record;
+      }
+    }
+    if (!manifest_attempts_for(mutation).empty()) {
+      // The identity is known to the authority and this ordinal is not one it
+      // accepted, so the answer is "no record" rather than an older file's word.
+      return internal::AttemptRecord{};
+    }
+    CFM_TRY(legacy, legacy_attempts_for(mutation));
+    for (const internal::AttemptRecord& record : legacy) {
+      if (record.ordinal == attempt) {
+        return record;
+      }
+    }
+    return internal::AttemptRecord{};
+  }
+
+  /// True when an accepted-attempt record for the same mutation but a strictly
+  /// higher ordinal exists. Attempt ordinals are 1-based and must not go
+  /// backwards: an ordinal below an accepted one is a reused identity, never a
+  /// new attempt.
+  ///
+  /// The highest ordinal either source records is what the new ordinal must
+  /// exceed. Both sources are consulted because an identity the authority carries
+  /// may also have a record from before the upgrade, and the rule is about the
+  /// identity rather than about which record is newer: an ordinal below any
+  /// accepted ordinal is a reused identity whichever record carries it.
+  Result<bool> has_accepted_newer_ordinal(const MutationId& mutation,
+                                          const AttemptOrdinal& attempt) const {
+    for (const internal::AttemptRecord& record : manifest_attempts_for(mutation)) {
+      if (attempt < record.ordinal) {
+        return true;
+      }
+    }
+    CFM_TRY(legacy, legacy_attempts_for(mutation));
+    for (const internal::AttemptRecord& record : legacy) {
+      if (attempt < record.ordinal) {
         return true;
       }
     }
@@ -687,10 +777,12 @@ struct Store::Impl {
     return removed;
   }
 
-  /// Bounds the accepted-attempt records, evicting the oldest by commit sequence.
-  /// The record just written is never evicted, and a record that no longer
-  /// decodes is left in place for verify() to report rather than deleted.
-  Result<std::size_t> evict_attempt_records(const std::string& keep_name) {
+  /// Bounds the accepted-attempt files of a store written by an earlier release.
+  /// The authoritative replay window is the committed manifest, which needs no
+  /// pruning: it is rewritten in full at every commit, so an entry that leaves
+  /// the window simply stops carrying a record. A file that no longer decodes is
+  /// left in place for verify() to report rather than deleted.
+  Result<std::size_t> evict_legacy_attempt_records() {
     CFM_TRY(names, internal::list_directory(idempotency_path));
     if (names.size() <= options.idempotency_retention) {
       return 0;
@@ -722,13 +814,6 @@ struct Store::Impl {
     for (const auto& entry : ordered) {
       if (kept <= options.idempotency_retention) {
         break;
-      }
-      if (entry.second == keep_name) {
-        // The record of the publication that just committed is never evicted,
-        // even when an unusually small retention window would otherwise select
-        // it: evicting it would erase the replay identity of a mutation that is
-        // still in flight at the caller.
-        continue;
       }
       CFM_TRYV(internal::remove_file(join(idempotency_path, entry.second)));
       --kept;
@@ -901,7 +986,7 @@ Result<Store> Store::create(const StoreOptions& options, StoreId store_id) {
   impl.epoch = impl.writable ? WriterEpoch(1) : WriterEpoch();
   impl.incarnation = impl.writable ? WriterIncarnation(1) : WriterIncarnation();
   CFM_TRYV(impl.write_floor(StateGeneration(), CommitSequence(), options.durable_flush));
-  CFM_TRYV(impl.write_manifest(impl.manifest, options.durable_flush));
+  CFM_TRYV(impl.write_manifest(impl.manifest, options.durable_flush, false));
   impl.open = true;
   impl.manifest_readable = true;
   impl.head_verified = true;
@@ -1012,7 +1097,7 @@ Result<Store> Store::open(const StoreOptions& options) {
     impl.manifest.incarnation = next_incarnation;
     impl.epoch = next_epoch;
     impl.incarnation = next_incarnation;
-    CFM_TRYV(impl.write_manifest(impl.manifest, options.durable_flush));
+    CFM_TRYV(impl.write_manifest(impl.manifest, options.durable_flush, false));
     internal::fault_point(options.enable_fault_injection, kFaultOpenAfterReserve);
   }
   impl.open = true;
@@ -1060,10 +1145,36 @@ Result<StoreInfo> Store::info() const {
   // reports one retained entry: the all-zero generation 0 sentinel that stands
   // for "no state published yet". It is not a publication and is never loadable.
   info.retained_generations = impl.manifest.retained.size();
-  // The accepted-attempt records present, counted from the directory so the
-  // report never disagrees with what a retry would find.
+  // The number of identities a retry can be answered for: the replay records the
+  // committed authority carries, plus the accepted-attempt files an earlier
+  // release wrote for identities the authority does not carry. An identity
+  // present in both is counted once, because both answer it with the same
+  // committed result.
+  std::size_t replayable = impl.manifest.attempts.size();
   const auto names = internal::list_directory(impl.idempotency_path);
-  info.idempotency_records = names.has_value() ? names.value().size() : 0;
+  if (names.has_value()) {
+    for (const std::string& name : names.value()) {
+      const auto bytes = internal::read_file(join(impl.idempotency_path, name),
+                                             limits::kMaxIdempotencyRecordBytes);
+      if (!bytes.has_value()) {
+        continue;
+      }
+      const auto record = internal::decode_attempt_record(bytes.value());
+      if (!record.has_value()) {
+        continue;
+      }
+      const bool already_counted =
+          std::any_of(impl.manifest.attempts.begin(), impl.manifest.attempts.end(),
+                      [&](const internal::AttemptRecord& carried) {
+                        return carried.mutation == record.value().mutation &&
+                               carried.ordinal == record.value().ordinal;
+                      });
+      if (!already_counted) {
+        ++replayable;
+      }
+    }
+  }
+  info.idempotency_records = replayable;
   info.writable = impl.writable;
   info.publication_allowed = impl.writable && impl.open && impl.head_verified;
   info.root = impl.root;
@@ -1248,29 +1359,27 @@ Result<PublicationReceipt> Store::publish(const PublicationRequest& request) {
   const Digest content_digest = internal::request_content_digest(body);
 
   // ---- step 2: idempotency, resolved before any authority fence -----------
-  // A retry of an already accepted attempt is answered from its record even when
-  // its epoch, its incarnation and its base generation have all moved on. This
-  // ordering is what makes a lost response safe: the caller can never be told
-  // that a committed mutation failed and then be forced to plan it again.
-  const std::string record_name = internal::attempt_file_name(request.mutation, request.attempt);
-  const std::string record_path = join(impl.idempotency_path, record_name);
-  CFM_TRY(record_present, internal::path_exists(record_path));
-  if (record_present) {
-    // A record that does not decode is reported rather than skipped: skipping it
-    // could re-execute an operation whose outcome was already committed.
-    CFM_TRY(record_bytes, internal::read_file(record_path, limits::kMaxIdempotencyRecordBytes));
-    CFM_TRY(record, internal::decode_attempt_record(record_bytes));
-    if (record.request_digest != content_digest) {
+  // A retry of an already accepted attempt is answered from the committed
+  // authority even when its epoch, its incarnation and its base generation have
+  // all moved on. This ordering is what makes a lost response safe: the caller
+  // can never be told that a committed mutation failed and then be forced to
+  // plan it again. The accepted-attempt record is read from the committed
+  // manifest, so it is subject to exactly the same durability as the mutation it
+  // describes and there is no window in which one exists without the other.
+  CFM_TRY(accepted, impl.find_accepted_attempt(request.mutation, request.attempt));
+  if (!accepted.mutation.empty()) {
+    if (accepted.request_digest != content_digest) {
       return Error(ErrorCode::IdempotencyConflict,
                    "the mutation identity and attempt ordinal were already used for different "
                    "content")
           .with_subject(request.mutation.str())
           .with_detail("ordinal " + to_decimal(static_cast<std::uint64_t>(request.attempt.value())));
     }
-    return impl.replay_receipt(record, request);
+    return impl.replay_receipt(accepted, request);
   }
-  // An ordinal may not go backwards for one mutation identity: a lower ordinal is
-  // a reused identity, a higher ordinal is a new attempt.
+  // The record lives with the generation it committed, so finding it and finding
+  // the mutation committed are the same act; the ordinal rule below still applies
+  // to an identity whose exact ordinal is no longer inside the replay window.
   CFM_TRY(ordinal_behind, impl.has_accepted_newer_ordinal(request.mutation, request.attempt));
   if (ordinal_behind) {
     return Error(ErrorCode::IdempotencyConflict,
@@ -1382,8 +1491,96 @@ Result<PublicationReceipt> Store::publish(const PublicationRequest& request) {
       retained.push_back(entry);
     }
   }
+
+  // The replay table of the new manifest. It is rebuilt in full on every
+  // publication from the records themselves rather than pruned out of the
+  // retained chain, so an identity stays inside the window for exactly the
+  // documented number of publications and a record is never lost by an entry
+  // leaving the chain. The records an earlier release left in files are absorbed
+  // here as well, so a store that upgrades keeps the replay guarantee its
+  // existing records describe instead of losing it at the first publication.
+  const std::size_t attempts_retained = static_cast<std::size_t>(std::max<std::uint64_t>(
+      1, static_cast<std::uint64_t>(impl.options.idempotency_retention)));
+  std::vector<internal::AttemptRecord> attempts;
+  attempts.reserve(std::min<std::size_t>(attempts_retained, limits::kMaxIdempotencyRecords));
+  internal::AttemptRecord own;
+  own.mutation = request.mutation;
+  own.ordinal = request.attempt;
+  own.request_digest = content_digest;
+  own.generation = next_generation;
+  own.digest = digest;
+  own.commit = next_commit;
+  const auto still_retained = [&retained](const internal::AttemptRecord& record) {
+    for (const internal::ManifestEntry& entry : retained) {
+      if (entry.generation == record.generation) {
+        return true;
+      }
+    }
+    return false;
+  };
+  const auto already_carried = [](const std::vector<internal::AttemptRecord>& table,
+                                  const internal::AttemptRecord& record) {
+    for (const internal::AttemptRecord& item : table) {
+      if (item.mutation == record.mutation && item.ordinal == record.ordinal &&
+          item.generation == record.generation && item.digest == record.digest &&
+          item.commit == record.commit) {
+        return true;
+      }
+    }
+    return false;
+  };
+  attempts.push_back(own);
+  for (const internal::AttemptRecord& record : impl.manifest.attempts) {
+    // Every accepted attempt keeps its own record, because its ordinal is what
+    // makes it a distinct operation: a table that held only the newest attempt of
+    // an identity would silently make an earlier accepted attempt unreplayable.
+    // A record is only carried while the generation it names is still retained,
+    // because replaying it means naming the state that publication committed.
+    if (still_retained(record) && !already_carried(attempts, record)) {
+      attempts.push_back(record);
+    }
+  }
+  CFM_TRY(legacy_files, internal::list_directory(impl.idempotency_path));
+  for (const std::string& name : legacy_files) {
+    const auto bytes = internal::read_file(join(impl.idempotency_path, name),
+                                           limits::kMaxIdempotencyRecordBytes);
+    if (!bytes.has_value()) {
+      continue;
+    }
+    const auto record = internal::decode_attempt_record(bytes.value());
+    if (!record.has_value()) {
+      // A record that does not decode is reported by verify() rather than
+      // silently skipped, which is also why it is not carried here.
+      continue;
+    }
+    if (still_retained(record.value()) && !already_carried(attempts, record.value())) {
+      attempts.push_back(record.value());
+    }
+  }
+  // Newest generation first, which is the order the format requires. The sort is
+  // total: two records never share a generation, because a generation commits one
+  // publication, and the identity is the tie-break that makes that structural
+  // rather than assumed.
+  std::sort(attempts.begin(), attempts.end(),
+            [](const internal::AttemptRecord& lhs, const internal::AttemptRecord& rhs) {
+              if (lhs.generation != rhs.generation) {
+                return rhs.generation < lhs.generation;
+              }
+              if (!(lhs.mutation == rhs.mutation)) {
+                return lhs.mutation.str() < rhs.mutation.str();
+              }
+              return lhs.ordinal.value() < rhs.ordinal.value();
+            });
+  if (attempts.size() > attempts_retained) {
+    attempts.resize(attempts_retained);
+  }
+
   if (retained.size() > limits::kMaxRetainedGenerations) {
     return Error(ErrorCode::InternalError, "retained chain exceeds the documented bound");
+  }
+  if (attempts.size() > limits::kMaxIdempotencyRecords ||
+      attempts.size() > attempts_retained) {
+    return Error(ErrorCode::InternalError, "replay table exceeds the documented bound");
   }
 
   internal::Manifest committed = impl.manifest;
@@ -1395,6 +1592,7 @@ Result<PublicationReceipt> Store::publish(const PublicationRequest& request) {
   committed.floor = next_floor;
   committed.bytes = canonical_bytes.size();
   committed.retained = retained;
+  committed.attempts = attempts;
   committed.epoch = impl.epoch;
   committed.incarnation = impl.incarnation;
 
@@ -1463,7 +1661,7 @@ Result<PublicationReceipt> Store::publish(const PublicationRequest& request) {
   // The durable replacement of the head manifest is the single point at which
   // this publication becomes visible. Everything before it is invisible;
   // everything after it cannot be undone.
-  CFM_TRYV(impl.write_manifest(committed, durable));
+  CFM_TRYV(impl.write_manifest(committed, durable, true));
   impl.manifest = committed;
   internal::fault_point(impl.options.enable_fault_injection, kFaultPublishAfterManifest);
 
@@ -1478,26 +1676,14 @@ Result<PublicationReceipt> Store::publish(const PublicationRequest& request) {
   }
   internal::fault_point(impl.options.enable_fault_injection, kFaultPublishAfterFloor);
 
-  // ---- step 11: the accepted-attempt record ------------------------------
-  internal::AttemptRecord record;
-  record.mutation = request.mutation;
-  record.ordinal = request.attempt;
-  record.request_digest = content_digest;
-  record.generation = next_generation;
-  record.digest = digest;
-  record.commit = next_commit;
-  const std::string record_bytes = internal::encode_attempt_record(record);
-  const Result<void> record_written =
-      impl.write_record_atomically(record_path, record_bytes, durable);
-  if (!record_written.has_value()) {
-    // The publication is committed but its replay record is missing. A retry of
-    // this identity is then treated as a new mutation, which is exactly the
-    // window docs/FORMATS.md section 2.5 documents.
-    every_flush_ok = false;
-  }
-  internal::fault_point(impl.options.enable_fault_injection, kFaultPublishAfterIdem);
+  // No bookkeeping follows the commit point. The accepted-attempt record that
+  // makes a retry of this mutation a replay was written by the same durable
+  // replacement that committed the mutation, so there is no longer an interval in
+  // which one exists without the other and nothing after this line can lose the
+  // identity of what was just committed.
+  internal::fault_point(impl.options.enable_fault_injection, kFaultPublishAfterCommit);
 
-  // ---- step 12: retire and clean -----------------------------------------
+  // ---- step 11: retire and clean -----------------------------------------
   const Result<std::size_t> retired = impl.retire_outside_window(next_floor, next_generation);
   if (!retired.has_value()) {
     every_flush_ok = false;
@@ -1506,7 +1692,10 @@ Result<PublicationReceipt> Store::publish(const PublicationRequest& request) {
   if (!residue.has_value()) {
     every_flush_ok = false;
   }
-  const Result<std::size_t> evicted = impl.evict_attempt_records(record_name);
+  // Records left by a release that kept them in files of their own are bounded
+  // here; the authoritative window is the committed manifest, which needs no
+  // pruning because it is rewritten in full on every publication.
+  const Result<std::size_t> evicted = impl.evict_legacy_attempt_records();
   if (!evicted.has_value()) {
     every_flush_ok = false;
   }
@@ -1765,7 +1954,47 @@ Result<VerifyReport> Store::verify(const VerifyOptions& options) const {
     }
   }
 
-  // ---- accepted-attempt records -------------------------------------------
+  // ---- the replay index carried by the committed manifest ----------------
+  // The manifest is the authority, so its replay index is what a retry is
+  // answered from. It is checked here in the order the retained chain is read: an
+  // entry whose record does not belong to it, or two entries that claim the same
+  // identity, would make the answer to a retry depend on which one was found
+  // first.
+  if (options.verify_idempotency) {
+    std::vector<std::pair<MutationId, AttemptOrdinal>> seen;
+    for (const internal::AttemptRecord& record : impl.manifest.attempts) {
+      const std::string subject =
+          record.mutation.str() + "#" +
+          to_decimal(static_cast<std::uint64_t>(record.ordinal.value()));
+      bool retained_generation = false;
+      for (const internal::ManifestEntry& entry : impl.manifest.retained) {
+        if (entry.generation == record.generation && entry.digest == record.digest &&
+            entry.commit == record.commit) {
+          retained_generation = true;
+          break;
+        }
+      }
+      if (!retained_generation) {
+        impl.add_finding(report, VerifySeverity::Defect, kFindingReplayInconsistent, subject,
+                         "the replay record does not name a retained generation");
+      }
+      if (record.request_digest.is_zero()) {
+        impl.add_finding(report, VerifySeverity::Defect, kFindingReplayInconsistent, subject,
+                         "the replay record carries no intent digest");
+      }
+      const bool duplicate =
+          std::any_of(seen.begin(), seen.end(), [&](const std::pair<MutationId, AttemptOrdinal>& item) {
+            return item.first == record.mutation && item.second == record.ordinal;
+          });
+      if (duplicate) {
+        impl.add_finding(report, VerifySeverity::Defect, kFindingReplayDuplicate, subject,
+                         "two replay records claim the same accepted attempt");
+      }
+      seen.emplace_back(record.mutation, record.ordinal);
+    }
+  }
+
+  // ---- accepted-attempt files left by an earlier release ------------------
   if (options.verify_idempotency) {
     const auto records = internal::list_directory(impl.idempotency_path);
     if (!records.has_value()) {
@@ -1790,6 +2019,27 @@ Result<VerifyReport> Store::verify(const VerifyOptions& options) const {
         if (!record.has_value()) {
           impl.add_finding(report, VerifySeverity::Defect, kFindingIdempotencyUnreadable, name,
                            record.error().to_string());
+          continue;
+        }
+        // A legacy file is only consulted when the committed authority does not
+        // already answer its identity. One that claims an identity the authority
+        // does answer, with a different result, is a disagreement about what a
+        // committed mutation returned; it is reported rather than resolved,
+        // because either answer would be a guess about which record is the
+        // mutation's.
+        for (const internal::AttemptRecord& carried : impl.manifest.attempts) {
+          if (!(carried.mutation == record.value().mutation) ||
+              !(carried.ordinal == record.value().ordinal)) {
+            continue;
+          }
+          if (carried.request_digest != record.value().request_digest ||
+              carried.generation != record.value().generation ||
+              carried.digest != record.value().digest ||
+              carried.commit != record.value().commit) {
+            impl.add_finding(report, VerifySeverity::Defect, kFindingReplayInconsistent, name,
+                             "the accepted-attempt file disagrees with the record the committed "
+                             "manifest carries for the same identity");
+          }
         }
       }
     }
@@ -1992,7 +2242,7 @@ Result<RecoveryReport> Store::recover(const RecoveryOptions& options) {
   impl.manifest.incarnation = next_incarnation;
   impl.epoch = next_epoch;
   impl.incarnation = next_incarnation;
-  CFM_TRYV(impl.write_manifest(impl.manifest, impl.options.durable_flush));
+  CFM_TRYV(impl.write_manifest(impl.manifest, impl.options.durable_flush, false));
   impl.manifest_readable = true;
   impl.head_verified = true;
   impl.recovery_reason.clear();
@@ -2066,16 +2316,14 @@ Result<std::size_t> Store::reconcile_unresolved(const AuthoritySet& authority,
   // The reconciliation identity is resolved before anything else is derived, so
   // a repeated call replays the recorded reconciliation even when the head has
   // moved on and even when nothing is in flight any more. Without this, a retry
-  // could silently reconcile a different state.
-  const std::string record_path =
-      join(impl.idempotency_path, internal::attempt_file_name(mutation, attempt));
-  CFM_TRY(record_present, internal::path_exists(record_path));
-  if (record_present) {
-    CFM_TRY(record_bytes, internal::read_file(record_path, limits::kMaxIdempotencyRecordBytes));
-    CFM_TRY(record, internal::decode_attempt_record(record_bytes));
+  // could silently reconcile a different state. The record is read from the
+  // committed manifest, so a reconciliation that crossed the commit point is
+  // recognised however the process died afterwards.
+  CFM_TRY(accepted, impl.find_accepted_attempt(mutation, attempt));
+  if (!accepted.mutation.empty()) {
     // The number reported is read from the state the recorded reconciliation
     // published, which is the number its first execution reported.
-    CFM_TRY(replayed_state, impl.load_generation(record.generation));
+    CFM_TRY(replayed_state, impl.load_generation(accepted.generation));
     return count_adopted_unresolved(replayed_state.body);
   }
 

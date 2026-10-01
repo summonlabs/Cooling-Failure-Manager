@@ -187,7 +187,7 @@ CT_TEST(cli_version_reports_the_boundary) {
   const CliRun run = run_cli({"version"});
   CT_CHECK_EQ(run.exit_code, 0);
   CT_CHECK(run.output.find("cfmctl") != std::string::npos);
-  CT_CHECK(run.output.find("1.0.0") != std::string::npos);
+  CT_CHECK(run.output.find("1.0.1") != std::string::npos);
   CT_CHECK(run.output.find("no actuation") != std::string::npos);
   CT_CHECK(run.output.find("dccp-cooling-failure-state") != std::string::npos);
 }

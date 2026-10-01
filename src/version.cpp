@@ -5,7 +5,7 @@
 
 namespace dccp::cooling_failure_manager {
 
-std::string_view version_string() noexcept { return "1.0.0"; }
+std::string_view version_string() noexcept { return "1.0.1"; }
 
 std::string_view systems_boundary() noexcept {
   return "generation-bound cooling-failure classification, response-plan and recovery gate "
@@ -13,6 +13,6 @@ std::string_view systems_boundary() noexcept {
          "thermal-safety policy, no workload placement";
 }
 
-std::string_view component_id() noexcept { return "dccp-cooling-failure-manager/1.0.0"; }
+std::string_view component_id() noexcept { return "dccp-cooling-failure-manager/1.0.1"; }
 
 }  // namespace dccp::cooling_failure_manager

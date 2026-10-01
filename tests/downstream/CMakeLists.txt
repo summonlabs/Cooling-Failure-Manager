@@ -8,7 +8,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(cooling_failure_manager_downstream_consumer
-        VERSION 1.0.0
+        VERSION 1.0.1
         DESCRIPTION "Out-of-tree consumer of the installed Cooling Failure Manager package"
         LANGUAGES CXX)
 

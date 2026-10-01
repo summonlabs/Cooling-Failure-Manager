@@ -14,9 +14,9 @@ namespace dccp::cooling_failure_manager {
 /// drift apart silently.
 inline constexpr std::uint32_t kVersionMajor = 1;
 inline constexpr std::uint32_t kVersionMinor = 0;
-inline constexpr std::uint32_t kVersionPatch = 0;
+inline constexpr std::uint32_t kVersionPatch = 1;
 
-/// "1.0.0"
+/// "1.0.1"
 std::string_view version_string() noexcept;
 
 /// The systems boundary this library implements, in one line.
@@ -28,7 +28,7 @@ std::string_view systems_boundary() noexcept;
 
 /// Machine-readable component name used in provenance records.
 ///
-/// "dccp-cooling-failure-manager/1.0.0"
+/// "dccp-cooling-failure-manager/1.0.1"
 std::string_view component_id() noexcept;
 
 }  // namespace dccp::cooling_failure_manager

@@ -197,6 +197,23 @@ Result<void> require_version(std::string_view field_version) {
   return ok();
 }
 
+/// Version 2 of the manifest record carries the accepted-attempt record of each
+/// retained generation, so a committed mutation and the identity that makes its
+/// retry a replay cross the commit point together. Version 1 is still read: a
+/// store written before the replay record lived in the manifest keeps every
+/// accepted-attempt record it still holds, and its next publication writes
+/// version 2.
+constexpr std::string_view kManifestVersionWithReplay = "2";
+
+Result<void> require_manifest_version(std::string_view field_version) {
+  if (field_version != kFormatVersion && field_version != kManifestVersionWithReplay) {
+    return Error(ErrorCode::UnsupportedSchemaVersion,
+                 "manifest format version is not supported")
+        .with_subject(std::string(field_version.substr(0, 32)));
+  }
+  return ok();
+}
+
 /// The number of LF bytes in a canonical body. The generation record declares it
 /// so a body of the same length but different content is still refused.
 std::uint64_t body_line_count(std::string_view body) {
@@ -279,9 +296,11 @@ Result<StateGeneration> decode_floor(std::string_view text) {
 std::string encode_manifest(const Manifest& manifest) {
   std::string out;
   out.reserve(512 + manifest.retained.size() * 256);
+  // A manifest declares its replay table in its header, so the record version is
+  // always the one that has an attempt count.
   out.append(kManifestRecordName);
   out.push_back(kFieldSeparator);
-  out.append(kFormatVersion);
+  out.append(kManifestVersionWithReplay);
   out.push_back(kFieldSeparator);
   out.append("store=").append(manifest.store_id.str());
   out.push_back(kFieldSeparator);
@@ -304,6 +323,8 @@ std::string encode_manifest(const Manifest& manifest) {
   out.append("bytes=").append(to_decimal(manifest.bytes));
   out.push_back(kFieldSeparator);
   out.append("retained=").append(to_decimal(manifest.retained.size()));
+  out.push_back(kFieldSeparator);
+  out.append("attempt=").append(to_decimal(manifest.attempts.size()));
   out.push_back(kLineSeparator);
   for (std::size_t index = 0; index < manifest.retained.size(); ++index) {
     const ManifestEntry& entry = manifest.retained[index];
@@ -324,10 +345,33 @@ std::string encode_manifest(const Manifest& manifest) {
     out.append("bytes=").append(to_decimal(entry.bytes));
     out.push_back(kLineSeparator);
   }
+  // The replay table, newest generation first. Every field is written, so a
+  // record can be read without consulting the retained chain and a record that
+  // names a generation the chain no longer holds is refused rather than silently
+  // completed from it.
+  for (const AttemptRecord& record : manifest.attempts) {
+    out.append("attempt");
+    out.push_back(kFieldSeparator);
+    out.append("mutation=").append(record.mutation.str());
+    out.push_back(kFieldSeparator);
+    out.append("ordinal=").append(
+        to_decimal(static_cast<std::uint64_t>(record.ordinal.value())));
+    out.push_back(kFieldSeparator);
+    out.append("request=").append(record.request_digest.to_hex());
+    out.push_back(kFieldSeparator);
+    out.append("generation=").append(to_decimal(record.generation.value()));
+    out.push_back(kFieldSeparator);
+    out.append("digest=").append(record.digest.to_hex());
+    out.push_back(kFieldSeparator);
+    out.append("commit=").append(to_decimal(record.commit.value()));
+    out.push_back(kLineSeparator);
+  }
   // The digest covers every preceding byte including the LF that terminates the
   // last retained line; the trailer that carries the digest is not covered.
   const std::size_t covered = out.size();
   out.append("count=").append(to_decimal(manifest.retained.size()));
+  out.push_back(kFieldSeparator);
+  out.append("attempt=").append(to_decimal(manifest.attempts.size()));
   out.push_back(kFieldSeparator);
   out.append(digest_bytes(std::string_view(out).substr(0, covered)).to_hex());
   out.push_back(kLineSeparator);
@@ -388,11 +432,17 @@ Result<Manifest> decode_manifest(std::string_view text) {
       return malformed("manifest header must carry at least its format name and version");
     }
     CFM_TRYV(require_header(header[0], kManifestRecordName));
-    CFM_TRYV(require_version(header[1]));
-    if (header.size() != 13) {
+    CFM_TRYV(require_manifest_version(header[1]));
+    // A version 1 manifest declares no replay table and has thirteen fields; a
+    // version 2 manifest declares it and has fourteen. The shape is decided by the
+    // field count, so a record whose version and shape disagree is still read for
+    // what it says rather than refused for saying it twice.
+    const bool declares_attempts = header.size() == 14;
+    if (header.size() != 13 && header.size() != 14) {
       return malformed(
           "manifest header must carry exactly name, version, store, head, head_digest, parent, "
-          "parent_digest, commit, floor, epoch, incarnation, bytes and retained");
+          "parent_digest, commit, floor, epoch, incarnation, bytes and retained, plus attempt in "
+          "version 2");
     }
     CFM_TRY(store_id, field_store_id(header[2]));
     manifest.store_id = std::move(store_id);
@@ -415,6 +465,16 @@ Result<Manifest> decode_manifest(std::string_view text) {
     CFM_TRY(bytes, field_u64(header[11], "bytes", UINT64_MAX));
     manifest.bytes = bytes;
     CFM_TRY(retained_declared, field_u64(header[12], "retained", UINT64_MAX));
+    std::uint64_t attempts_declared = 0;
+    if (declares_attempts) {
+      CFM_TRY(value, field_u64(header[13], "attempt", UINT64_MAX));
+      attempts_declared = value;
+      if (attempts_declared > limits::kMaxIdempotencyRecords) {
+        return Error(ErrorCode::LimitExceeded,
+                     "manifest declares more replay records than the documented bound")
+            .with_subject(to_decimal(attempts_declared));
+      }
+    }
     if (retained_declared > limits::kMaxRetainedGenerations) {
       return Error(ErrorCode::LimitExceeded,
                    "manifest declares more retained generations than the documented bound")
@@ -424,10 +484,12 @@ Result<Manifest> decode_manifest(std::string_view text) {
       return malformed("manifest must retain at least the head entry");
     }
     const std::size_t expected_entries = static_cast<std::size_t>(retained_declared);
-    if (lines.size() - 1 != expected_entries) {
+    const std::size_t expected_attempts = static_cast<std::size_t>(attempts_declared);
+    if (lines.size() - 1 != expected_entries + expected_attempts) {
       return Error(ErrorCode::CountMismatch,
-                   "manifest retained= does not match the retained lines it carries")
-          .with_subject("declared " + to_decimal(retained_declared) + ", present " +
+                   "manifest retained= and attempt= do not match the lines it carries")
+          .with_subject("declared " + to_decimal(retained_declared) + " retained and " +
+                        to_decimal(attempts_declared) + " attempt, present " +
                         to_decimal(lines.size() - 1));
     }
     manifest.retained.reserve(expected_entries);
@@ -463,12 +525,58 @@ Result<Manifest> decode_manifest(std::string_view text) {
       entry.bytes = entry_bytes;
       manifest.retained.push_back(entry);
     }
+    manifest.attempts.reserve(expected_attempts);
+    for (std::size_t index = 0; index < expected_attempts; ++index) {
+      const std::string_view line = lines[1 + expected_entries + index];
+      CFM_TRY(attempt_fields, fields_of(line));
+      if (attempt_fields.size() != 7) {
+        return malformed(
+            "manifest attempt record must carry exactly its name, mutation, ordinal, request, "
+            "generation, digest and commit");
+      }
+      if (attempt_fields[0] != "attempt") {
+        return malformed("manifest attempt record does not start with its record name")
+            .with_subject(std::string(attempt_fields[0].substr(0, 96)));
+      }
+      CFM_TRY(mutation_text, field_value(attempt_fields[1], "mutation"));
+      CFM_TRY(mutation, MutationId::parse(mutation_text));
+      AttemptRecord record;
+      record.mutation = std::move(mutation);
+      CFM_TRY(ordinal, field_u64(attempt_fields[2], "ordinal", UINT32_MAX));
+      if (ordinal == 0) {
+        return Error(ErrorCode::MalformedNumber,
+                     "a replay record carries a 1-based attempt ordinal")
+            .with_subject("ordinal " + to_decimal(static_cast<std::uint64_t>(index)));
+      }
+      record.ordinal = AttemptOrdinal(static_cast<std::uint32_t>(ordinal));
+      CFM_TRY(request, field_digest(attempt_fields[3], "request"));
+      record.request_digest = request;
+      if (record.request_digest.is_zero()) {
+        return Error(ErrorCode::HeadCorrupt, "a replay record carries a zero intent digest")
+            .with_subject(record.mutation.str());
+      }
+      CFM_TRY(generation, field_u64(attempt_fields[4], "generation", UINT64_MAX));
+      if (generation == 0) {
+        return malformed("a replay record must name a published generation")
+            .with_subject(record.mutation.str());
+      }
+      record.generation = StateGeneration(generation);
+      CFM_TRY(digest, field_digest(attempt_fields[5], "digest"));
+      record.digest = digest;
+      CFM_TRY(record_commit, field_u64(attempt_fields[6], "commit", UINT64_MAX));
+      if (record_commit == 0) {
+        return malformed("a replay record must name a committed sequence")
+            .with_subject(record.mutation.str());
+      }
+      record.commit = CommitSequence(record_commit);
+      manifest.attempts.push_back(record);
+    }
   }
 
   {
     CFM_TRY(trailer_fields, fields_of(trailer));
-    if (trailer_fields.size() != 2) {
-      return malformed("manifest trailer must carry exactly count and the digest");
+    if (trailer_fields.size() != 3) {
+      return malformed("manifest trailer must carry exactly count, attempt and the digest");
     }
     CFM_TRY(trailer_count, field_u64(trailer_fields[0], "count", UINT64_MAX));
     if (trailer_count != manifest.retained.size()) {
@@ -477,7 +585,14 @@ Result<Manifest> decode_manifest(std::string_view text) {
           .with_subject("declared " + to_decimal(trailer_count) + ", present " +
                         to_decimal(manifest.retained.size()));
     }
-    CFM_TRY(expected, trailing_digest(trailer_fields[1]));
+    CFM_TRY(trailer_attempts, field_u64(trailer_fields[1], "attempt", UINT64_MAX));
+    if (trailer_attempts != manifest.attempts.size()) {
+      return Error(ErrorCode::CountMismatch,
+                   "manifest trailer attempt count does not match the replay records present")
+          .with_subject("declared " + to_decimal(trailer_attempts) + ", present " +
+                        to_decimal(manifest.attempts.size()));
+    }
+    CFM_TRY(expected, trailing_digest(trailer_fields[2]));
     if (digest_bytes(covered) != expected) {
       return Error(ErrorCode::DigestMismatch, "manifest checksum does not match its content");
     }
@@ -539,6 +654,48 @@ Result<Manifest> decode_manifest(std::string_view text) {
       return Error(ErrorCode::HeadCorrupt,
                    "manifest retained entry names a published generation without a digest")
           .with_subject("ordinal " + to_decimal(static_cast<std::uint64_t>(index)));
+    }
+  }
+  // The replay table is newest generation first, it names each identity and each
+  // generation at most once, and every generation it names is still retained. A
+  // record for a generation the chain no longer holds would be a replay answer
+  // for a state this store cannot serve, so it is refused here rather than at the
+  // retry that would discover it.
+  for (std::size_t index = 0; index < manifest.attempts.size(); ++index) {
+    const AttemptRecord& record = manifest.attempts[index];
+    if (index > 0 && !(manifest.attempts[index - 1].generation > record.generation)) {
+      return Error(ErrorCode::HeadCorrupt,
+                   "manifest replay records must be strictly ordered newest first")
+          .with_subject(record.mutation.str());
+    }
+    bool retained_generation = false;
+    for (const ManifestEntry& entry : manifest.retained) {
+      if (entry.generation == record.generation && entry.digest == record.digest &&
+          entry.commit == record.commit) {
+        retained_generation = true;
+        break;
+      }
+    }
+    if (!retained_generation) {
+      return Error(ErrorCode::HeadCorrupt,
+                   "manifest replay record does not name a retained generation")
+          .with_subject(record.mutation.str());
+    }
+    for (std::size_t other = 0; other < manifest.attempts.size(); ++other) {
+      if (other == index) {
+        continue;
+      }
+      if (manifest.attempts[other].mutation == record.mutation &&
+          manifest.attempts[other].ordinal == record.ordinal) {
+        return Error(ErrorCode::HeadCorrupt,
+                     "manifest carries two replay records for one accepted attempt")
+            .with_subject(record.mutation.str());
+      }
+      if (manifest.attempts[other].generation == record.generation) {
+        return Error(ErrorCode::HeadCorrupt,
+                     "manifest carries two replay records for one generation")
+            .with_subject(record.mutation.str());
+      }
     }
   }
   return manifest;

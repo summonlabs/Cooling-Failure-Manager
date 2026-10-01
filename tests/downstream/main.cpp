@@ -45,8 +45,8 @@ int main(int argc, char** argv) {
   // 1. The installed headers and the installed library agree on the version, and
   //    the consumer's own compile-time expectation of the ABI major matches.
   const std::string version(cfm::version_string());
-  check(version == "1.0.0", "version_string is 1.0.0");
-  check(cfm::kVersionMajor == 1 && cfm::kVersionMinor == 0 && cfm::kVersionPatch == 0,
+  check(version == "1.0.1", "version_string is 1.0.1");
+  check(cfm::kVersionMajor == 1 && cfm::kVersionMinor == 0 && cfm::kVersionPatch == 1,
         "compiled-in version components");
   check(!cfm::systems_boundary().empty(), "systems boundary is documented");
 

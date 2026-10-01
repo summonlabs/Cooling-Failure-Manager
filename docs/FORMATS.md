@@ -114,12 +114,19 @@ Layout of the store root:
     manifest              authoritative head record (the commit point)
     manifest.prev         previous committed head record
     generations/          immutable generation files
-    idem/                 accepted-attempt records
+    idem/                 accepted-attempt records written by release 1.0.0
     staging/              transient staging area; empty between publications
 
 Generation file name: `g<20-digit-zero-padded-generation>.dat`
 
 Idempotency file name: `m<sha256-hex-of-(mutation-id + tab + ordinal)>.dat`
+
+Since release 1.0.1 the accepted-attempt record of a publication is carried by
+the retained manifest entry that commits it, and `idem/` holds nothing on a store
+this release created. The directory is still read, so a store written by 1.0.0
+keeps the replay guarantee its existing records describe, and files that
+disagree with the committed authority are reported by verification as
+`replay.inconsistent`.
 
 ### 2.1 floor
 
@@ -129,8 +136,10 @@ The digest covers every byte up to and including the TAB before it.
 
 ### 2.2 manifest
 
-    dccp-cooling-failure-manifest<TAB>1<TAB>store=<id><TAB>head=<u64><TAB>head_digest=<hex><TAB>parent=<u64><TAB>parent_digest=<hex><TAB>commit=<u64><TAB>floor=<u64><TAB>epoch=<u64><TAB>incarnation=<u64><TAB>bytes=<u64><TAB>retained=<n><TAB>count=<u64><TAB><sha256-hex>
+    dccp-cooling-failure-manifest<TAB>2<TAB>store=<id><TAB>head=<u64><TAB>head_digest=<hex><TAB>parent=<u64><TAB>parent_digest=<hex><TAB>commit=<u64><TAB>floor=<u64><TAB>epoch=<u64><TAB>incarnation=<u64><TAB>bytes=<u64><TAB>retained=<n><TAB>attempt=<m>
     retained<TAB>ordinal=<u32><TAB>generation=<u64><TAB>digest=<hex><TAB>parent=<u64><TAB>parent_digest=<hex><TAB>commit=<u64><TAB>bytes=<u64>
+    attempt<TAB>mutation=<id><TAB>ordinal=<u32><TAB>request=<hex><TAB>generation=<u64><TAB>digest=<hex><TAB>commit=<u64>
+    count=<n><TAB>attempt=<m><TAB><sha256-hex>
 
 `head` is the generation number of the committed head.
 `parent` is the generation the head was derived from (0 for a first publication).
@@ -138,7 +147,43 @@ The digest covers every byte up to and including the TAB before it.
 `epoch` and `incarnation` identify the writer that committed the head,
 so a successor can detect that it inherited a store it did not write.
 The digest covers every preceding byte including the LF that terminates the last
-retained line.
+attempt line.
+
+**The replay table.** The `attempt` records are the accepted-attempt records this
+authority carries, newest generation first. Each one is the identity of a mutation
+(`mutation`), the 1-based `ordinal` it was accepted under, and `request`: the
+digest of the canonical encoding of the request body with the generation and
+parent generation zeroed (`request_content_digest`, section 2.4). The `generation`,
+`digest` and `commit` fields are the committed result a retry is answered with.
+
+**Why the table is here.** The durable replacement of this record is the single
+commit point of a publication. A record written after that point could be lost by
+a crash while the mutation it describes stayed committed, and a lost-response
+retry of such a mutation would then be treated as a new mutation and publish a
+second generation. Inside the manifest there is no such interval: the mutation
+and the record that makes its retry a replay become visible together, or neither
+does, through one atomic directory-entry replacement.
+
+**The replay window.** A record is carried while the generation it names is still
+retained, and the table holds at most `min(retained_generations,`
+`idempotency_retention)` records. The window is therefore a property of the
+committed bytes rather than of any later write, and it is bounded and
+deterministic: an identity stays replayable for exactly as many publications as
+both retention settings allow, and then its record goes with the generation it
+named. A retry inside the window is answered with the committed result before any
+stale precondition is judged, whatever crash boundary the previous attempt
+reached and however many times the store has been reopened. Outside it, a retry
+is a new mutation, and the ordinal rule of step 2 still refuses a reused identity
+whose ordinal has gone backwards.
+
+Each accepted attempt keeps its own record, because the ordinal is what makes it
+a distinct operation; two records for one identity are distinct precisely when
+their ordinals differ, and two records for one identity and one ordinal are
+refused as corruption.
+
+Version 1 of this record has thirteen header fields, no `attempt` group and no
+trailer `attempt=`; it is still read, so a store written by release 1.0.0
+opens, and its next publication writes version 2.
 
 ### 2.3 generation file
 
@@ -154,11 +199,20 @@ that ends the header line and must end at end of file.
 
 ### 2.4 idempotency record
 
+The record a retry is answered from is the replay record of section 2.2: it lives
+in the committed manifest, crosses the commit point with the mutation it
+describes, and is the authority. `request` is the digest of the canonical encoding
+of the request body the attempt carried, so a replay with different content is an
+IdempotencyConflict rather than a replayed success.
+
+Release 1.0.0 kept this record in a file of its own:
+
     dccp-cooling-failure-attempt<TAB>1<TAB>mutation=<id><TAB>ordinal=<u32><TAB>request=<hex><TAB>generation=<u64><TAB>digest=<hex><TAB>commit=<u64><TAB>count=<u64><TAB><sha256-hex>
 
-`request` is the digest of the canonical encoding of the request body the
-attempt carried, so a replay with different content is an IdempotencyConflict
-rather than a replayed success.
+Those files are still read, after the committed manifest, so an upgraded store
+answers a retry whose record predates the upgrade. They are never written, and a
+file that disagrees with the committed manifest about an identity the manifest
+does answer is reported by verification rather than resolved.
 
 ### 2.5 Publication protocol
 
@@ -189,26 +243,34 @@ The single commit point is the durable replacement of `manifest`.
 7. Atomically rename the staged file to `generations/g<gen>.dat`.
 8. Write `manifest.prev` with the *current* manifest bytes verbatim
    (skipped when no manifest exists yet).
-9. Durably write the new `manifest`. **This is the commit point.**
+9. Durably write the new `manifest`, whose replay table now carries this
+   publication's accepted-attempt record. **This is the commit point**; the
+   mutation and the identity that makes its retry a replay become durable
+   together.
 10. Durably write `floor` with floor = min(committed floor so far).
-11. Write the idempotency record for this attempt.
-12. Retire generation files below the retention window and remove `staging/`
-    residue that is not referenced by the new head.
+11. Retire generation files below the retention window, remove `staging/`
+    residue that is not referenced by the new head, and evict `idem/` files left
+    by release 1.0.0 beyond the retention window.
+
+Nothing is written after the commit point that a retry depends on.
 
 Crash behaviour:
 
-* Crash before 9: the head is unchanged. The new generation file is an orphan
-  (newer than the head, unreferenced). It is reported by verification and removed
-  by the next successful publication or by recovery. It is never adopted.
+* Crash before 9: the head is unchanged and no replay record exists, so a retry
+  of the same identity performs exactly one mutation. The new generation file is
+  an orphan (newer than the head, unreferenced). It is reported by verification
+  and removed by the next successful publication or by recovery. It is never
+  adopted.
+* Crash after 9: the head is committed and its replay record is committed with
+  it. A retry of the same identity and the same intent is answered with the
+  committed result, resolves before the epoch, incarnation, generation and binding
+  fences, and publishes nothing. A retry with a different intent is
+  IdempotencyConflict. This holds at every boundary from the atomic replacement
+  onwards: immediately after the replacement, after the in-memory head moved,
+  before and after the floor, after cleanup, and after the call returned.
 * Crash after 9 before 10: the head is committed; the floor is behind but is
   still monotone (it is only ever lowered to the committed head when the head is
   ahead, and that direction is refused). Recovery re-derives it.
-* Crash after 9 before 11: the publication is committed but its idempotency
-  record is missing. A retry of the same (mutation, ordinal) finds no record and
-  is published again as a new generation. This is documented in the README: the
-  replay guarantee holds only for an attempt whose record was written, and the
-  ordering in step 11 places it immediately after the commit point to keep the
-  window as small as possible.
 
 ### 2.6 Recovery
 

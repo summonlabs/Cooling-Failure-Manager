@@ -24,8 +24,8 @@ using namespace dccp::cooling_failure_manager;
 }  // namespace
 
 CT_TEST(test_model_free_version_boundary) {
-  CT_CHECK_EQ(std::string(version_string()), std::string("1.0.0"));
-  CT_CHECK_EQ(std::string(component_id()), std::string("dccp-cooling-failure-manager/1.0.0"));
+  CT_CHECK_EQ(std::string(version_string()), std::string("1.0.1"));
+  CT_CHECK_EQ(std::string(component_id()), std::string("dccp-cooling-failure-manager/1.0.1"));
   CT_CHECK(!systems_boundary().empty());
 #ifdef COOLING_FAILURE_MANAGER_CMAKE_VERSION
   CT_CHECK_EQ(std::string(version_string()), std::string(COOLING_FAILURE_MANAGER_CMAKE_VERSION));

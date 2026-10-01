@@ -76,6 +76,7 @@ using dccp::cooling_failure_manager::Store;
 using dccp::cooling_failure_manager::StoreOptions;
 using dccp::cooling_failure_manager::to_decimal;
 using dccp::cooling_failure_manager::WriterEpoch;
+using dccp::cooling_failure_manager::WriterIncarnation;
 
 /// The name of the child case. The runner's --filter= is a substring match, so
 /// this name must not appear inside any other case name in this file: every
@@ -87,26 +88,48 @@ constexpr const char* kStageAfterStage = "publish.after-stage";
 constexpr const char* kStageBeforeRename = "publish.before-rename";
 constexpr const char* kStageAfterRename = "publish.after-rename";
 constexpr const char* kStageBeforeManifest = "publish.before-manifest";
+constexpr const char* kStageBeforeCommitEntry = "publish.before-commit-entry";
+constexpr const char* kStageAfterCommitEntry = "publish.after-commit-entry";
 constexpr const char* kStageAfterManifest = "publish.after-manifest";
 constexpr const char* kStageBeforeFloor = "publish.before-floor";
 constexpr const char* kStageAfterFloor = "publish.after-floor";
-constexpr const char* kStageAfterIdem = "publish.after-idem";
+constexpr const char* kStageAfterCommit = "publish.after-commit";
 constexpr const char* kStageAfterRetire = "publish.after-retire";
 constexpr const char* kStageEnter = "publish.enter";
 constexpr const char* kStageAfterLock = "open.after-lock";
 
+/// The identity and the ordinal the child publishes. Every case below retries
+/// exactly this identity, so a retry after any crash boundary is the retry of a
+/// known mutation rather than of a mutation the test guessed at.
+constexpr const char* kChildMutation = "child-mutation";
+constexpr std::uint32_t kChildOrdinal = 1;
+
 /// One crash boundary and the outcome docs/FORMATS.md section 2.5 documents for
 /// it: either the new generation is committed at the point, or it is not.
+///
+/// The stages are the ones this invariant is decided at: staging, the generation
+/// file, the head record before and after its atomic replacement, the former
+/// separate replay bookkeeping point, and full completion. A stage marked
+/// committed must be followed by a replay of the same identity; a stage marked
+/// uncommitted must be followed by exactly one new generation when the identity
+/// is published again.
 struct CrashBoundary {
   const char* stage;
   bool committed;
 };
 
 const CrashBoundary kBoundaries[] = {
-    {kStageAfterStage, false},     {kStageBeforeRename, false},
-    {kStageAfterRename, false},    {kStageBeforeManifest, false},
-    {kStageAfterManifest, true},   {kStageBeforeFloor, true},
-    {kStageAfterFloor, true},      {kStageAfterIdem, true},
+    {kStageEnter, false},
+    {kStageAfterStage, false},
+    {kStageBeforeRename, false},
+    {kStageAfterRename, false},
+    {kStageBeforeManifest, false},
+    {kStageBeforeCommitEntry, false},
+    {kStageAfterCommitEntry, true},
+    {kStageAfterManifest, true},
+    {kStageBeforeFloor, true},
+    {kStageAfterFloor, true},
+    {kStageAfterCommit, true},
     {kStageAfterRetire, true},
 };
 
@@ -140,7 +163,7 @@ void child_holder(const std::vector<std::string>& arguments) {
   child_report(report, "OPENED " + to_decimal(store.epoch().value()) + " " +
                            to_decimal(store.incarnation().value()) + " " +
                            to_decimal(store.info().value().head.value()));
-  PublicationRequest request = request_for(empty_state(clock), "child-mutation", 1);
+  PublicationRequest request = request_for(empty_state(clock), kChildMutation, kChildOrdinal);
   request.epoch = store.epoch();
   request.incarnation = store.incarnation();
   const auto receipt = store.publish(request);
@@ -319,6 +342,7 @@ CT_TEST(store_process_crash_at_every_publication_boundary_keeps_one_of_two_state
     const std::string root = join_path(directory, "store");
     const std::string report = join_path(directory, "child-report.txt");
     const std::int64_t child_clock = static_cast<std::int64_t>(5000 + index);
+    const std::uint64_t expected = boundary.committed ? 2 : 1;
 
     {
       Store store = create_fresh(root);
@@ -332,15 +356,13 @@ CT_TEST(store_process_crash_at_every_publication_boundary_keeps_one_of_two_state
     CT_CHECK(outcome.exited);
     CT_CHECK(outcome.report.find("OPENED") != std::string::npos);
 
-    // The store reopens, serves a fully verified head, and reports no defect:
-    // whatever the crash left behind is residue, not a half-published state.
+    // ---- reopen in this process and record the recovered authority ---------
     Store reopened = open_writer(root);
     const auto head = reopened.head();
     CT_CHECK_MSG(head.has_value(), std::string("stage ") + boundary.stage + " left no head");
     if (!head.has_value()) {
       continue;
     }
-    const std::uint64_t expected = boundary.committed ? 2 : 1;
     CT_CHECK_MSG(head.value().generation.value() == expected,
                  std::string("stage ") + boundary.stage + " produced generation " +
                      to_decimal(head.value().generation.value()) + " instead of " +
@@ -353,23 +375,116 @@ CT_TEST(store_process_crash_at_every_publication_boundary_keeps_one_of_two_state
       // The head is the state the parent committed, untouched.
       CT_CHECK_EQ(head.value().evaluated_at.milliseconds(), std::int64_t{100});
     }
+    const std::uint64_t recovered_generation = head.value().generation.value();
+    const auto recovered_head = reopened.head();
+    CT_REQUIRE(recovered_head.has_value());
+    const auto recovered_digest = recovered_head.value().generation;
+    static_cast<void>(recovered_digest);
+    const auto recovered_info = reopened.info();
+    CT_REQUIRE(recovered_info.has_value());
+    const auto recovered_head_digest = recovered_info.value().head_digest;
+
     const auto report_after = reopened.verify();
     CT_REQUIRE(report_after.has_value());
     CT_CHECK_MSG(report_after.value().head_verified,
                  std::string("stage ") + boundary.stage + " left an unverified head");
     CT_CHECK_MSG(report_after.value().ok(),
                  std::string("stage ") + boundary.stage + " left a defect");
-    // The observed outcome of this boundary, recorded so a run reports what each
-    // crash left behind rather than only that the assertions held.
+
+    // ---- the retry of the exact same mutation and intent ------------------
+    // The retry carries a zero epoch, a zero incarnation and no base generation,
+    // so nothing about it can be refused by the stale-authority or the
+    // stale-generation fence before the idempotency identity is resolved. If the
+    // mutation crossed the commit point, this must be answered with the committed
+    // result and must not publish anything.
+    const auto retry = [&] {
+      PublicationRequest request =
+          request_for(empty_state(child_clock), kChildMutation, kChildOrdinal);
+      request.epoch = WriterEpoch();
+      request.incarnation = WriterIncarnation();
+      return request;
+    }();
+    const auto retried = reopened.publish(retry);
+    if (!retried.has_value()) {
+      CT_CHECK_MSG(false, std::string("stage ") + boundary.stage + " refused the retry: " +
+                              std::string(dccp::cooling_failure_manager::error_code_name(
+                                  retried.error().code())));
+    }
+    if (retried.has_value()) {
+      if (boundary.committed) {
+        // Replay: the same committed generation, nothing new published, the
+        // authoritative digest unchanged, and the ordinal of the original.
+        CT_CHECK_MSG(retried.value().replayed,
+                     std::string("stage ") + boundary.stage +
+                         " answered a retry of a committed mutation as a new mutation");
+        CT_CHECK_MSG(retried.value().generation.value() == recovered_generation,
+                     std::string("stage ") + boundary.stage + " advanced the generation on replay");
+        CT_CHECK_MSG(retried.value().head_after.value() == recovered_generation,
+                     std::string("stage ") + boundary.stage + " moved the head on replay");
+        CT_CHECK(retried.value().mutation.str() == std::string(kChildMutation));
+        CT_CHECK_EQ(retried.value().attempt.value(), kChildOrdinal);
+      } else {
+        // The original never committed, so the retry performs exactly one
+        // mutation and lands on the next generation.
+        CT_CHECK_MSG(!retried.value().replayed,
+                     std::string("stage ") + boundary.stage +
+                         " replayed a mutation that never committed");
+        CT_CHECK_MSG(retried.value().generation.value() == expected + 1,
+                     std::string("stage ") + boundary.stage + " produced generation " +
+                         to_decimal(retried.value().generation.value()) + " instead of " +
+                         to_decimal(expected + 1));
+      }
+    }
+    // Whatever the retry answered, it advanced the generation at most once.
+    const auto after_retry = reopened.head();
+    CT_REQUIRE(after_retry.has_value());
+    const std::uint64_t generation_after_retry = after_retry.value().generation.value();
+    CT_CHECK_MSG(generation_after_retry == recovered_generation ||
+                     generation_after_retry == recovered_generation + 1,
+                 std::string("stage ") + boundary.stage + " advanced the generation by more than "
+                                                            "one across the retry");
+    if (boundary.committed) {
+      // A committed mutation is never republished, so its digest cannot move.
+      const auto after_info = reopened.info();
+      CT_REQUIRE(after_info.has_value());
+      CT_CHECK_MSG(after_info.value().head_digest == recovered_head_digest,
+                   std::string("stage ") + boundary.stage +
+                       " changed the authoritative digest on replay");
+    }
+
+    // ---- the same key with a different intent is never replayed ------------
     {
-      // Built by appending to one string: a const char* on the left of a
-      // std::string is not a valid addition, and to_decimal has two overloads
-      // that an int literal or an ambiguous width would not select.
+      PublicationRequest conflicting = request_for(empty_state(child_clock + 7), kChildMutation,
+                                                   kChildOrdinal);
+      conflicting.epoch = WriterEpoch();
+      conflicting.incarnation = WriterIncarnation();
+      const auto refused = reopened.publish(conflicting);
+      CT_CHECK_MSG(!refused.has_value(),
+                   std::string("stage ") + boundary.stage +
+                       " accepted one identity with two different intents");
+      if (!refused.has_value()) {
+        CT_CHECK_MSG(refused.error().code() == ErrorCode::IdempotencyConflict,
+                     std::string("stage ") + boundary.stage +
+                         " refused a conflicting intent with the wrong code");
+      }
+      const auto after_conflict = reopened.head();
+      CT_REQUIRE(after_conflict.has_value());
+      CT_CHECK_MSG(after_conflict.value().generation.value() == generation_after_retry,
+                   std::string("stage ") + boundary.stage +
+                       " changed the head while refusing a conflicting intent");
+    }
+
+    // ---- the observed outcome of this boundary ----------------------------
+    {
       std::string note = "stage ";
       note.append(boundary.stage);
       note.append(": head=");
-      note.append(to_decimal(head.value().generation.value()));
+      note.append(to_decimal(recovered_generation));
       note.append(boundary.committed ? " committed" : " not committed");
+      note.append(", replay=");
+      note.append(retried.has_value() ? (retried.value().replayed ? "yes" : "no") : "refused");
+      note.append(", after-retry=");
+      note.append(to_decimal(generation_after_retry));
       note.append(", staged_residue=");
       note.append(to_decimal(static_cast<std::uint64_t>(report_after.value().staged_residue_found)));
       note.append(", orphans=");
@@ -379,21 +494,42 @@ CT_TEST(store_process_crash_at_every_publication_boundary_keeps_one_of_two_state
       note.append(report_after.value().ok() ? "0" : "1");
       ct_test::report_note(note);
     }
-    const auto headline = reopened.history();
-    CT_REQUIRE(headline.has_value());
 
-    // Reopening again is idempotent: the same head and the same digest.
-    const auto digest_before = reopened.info().value().head_digest;
+    // ---- a second, independent reopen and verification ---------------------
     CT_CHECK(reopened.close().has_value());
     Store again = open_writer(root);
     const auto head_again = again.head();
     CT_REQUIRE(head_again.has_value());
-    CT_CHECK_EQ(head_again.value().generation.value(), head.value().generation.value());
-    CT_CHECK(again.info().value().head_digest == digest_before);
+    CT_CHECK_MSG(head_again.value().generation.value() == generation_after_retry,
+                 std::string("stage ") + boundary.stage +
+                     " changed generation on a second reopen");
+    const auto info_again = again.info();
+    CT_REQUIRE(info_again.has_value());
+    CT_CHECK_MSG(info_again.value().head_digest == recovered_head_digest ||
+                     !boundary.committed,
+                 std::string("stage ") + boundary.stage +
+                     " changed the recovered digest on a second reopen");
+    const auto verified_again = again.verify();
+    CT_REQUIRE(verified_again.has_value());
+    CT_CHECK_MSG(verified_again.value().ok(),
+                 std::string("stage ") + boundary.stage + " did not verify on a second reopen");
 
-    // Whatever residue the crash left, the next publication succeeds and the
-    // store converges: an uncommitted generation file is never adopted and never
-    // blocks the number it occupies.
+    // A retry after the second reopen replays again, so the answer does not
+    // depend on how many times the store has been reopened.
+    if (boundary.committed) {
+      const auto replayed_again = again.publish(retry);
+      CT_CHECK_MSG(replayed_again.has_value(),
+                   std::string("stage ") + boundary.stage + " refused the retry after a reopen");
+      if (replayed_again.has_value()) {
+        CT_CHECK_MSG(replayed_again.value().replayed,
+                     std::string("stage ") + boundary.stage +
+                         " answered the retry after a reopen as a new mutation");
+        CT_CHECK_EQ(replayed_again.value().generation.value(), generation_after_retry);
+      }
+    }
+
+    // Whatever residue the crash left, the next fresh mutation succeeds and the
+    // store converges.
     const auto published = again.publish([&] {
       PublicationRequest request = request_for(empty_state(child_clock + 1000), "m-next", 1);
       request.epoch = again.epoch();
@@ -403,8 +539,8 @@ CT_TEST(store_process_crash_at_every_publication_boundary_keeps_one_of_two_state
     CT_CHECK_MSG(published.has_value(),
                  std::string("stage ") + boundary.stage + " blocked the next publication");
     if (published.has_value()) {
-      CT_CHECK_EQ(published.value().generation.value(), expected + 1);
-      CT_CHECK_EQ(published.value().parent_generation.value(), expected);
+      CT_CHECK_EQ(published.value().generation.value(), generation_after_retry + 1);
+      CT_CHECK_EQ(published.value().parent_generation.value(), generation_after_retry);
     }
     const auto converged = again.verify();
     CT_REQUIRE(converged.has_value());

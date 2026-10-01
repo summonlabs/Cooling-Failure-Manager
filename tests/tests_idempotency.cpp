@@ -23,6 +23,7 @@
 #include "dccp/cooling_failure_manager/model.hpp"
 #include "dccp/cooling_failure_manager/store.hpp"
 #include "dccp/cooling_failure_manager/text.hpp"
+#include "file_ops.hpp"
 #include "store_internal.hpp"
 
 // ---------------------------------------------------------------------------
@@ -56,6 +57,28 @@ std::vector<std::string> list_names(const std::string& directory);
 }  // namespace cfm_store_support
 
 namespace {
+
+/// The committed head manifest, decoded. Read from the file rather than from any
+/// handle, so an assertion about durable content is an assertion about the bytes
+/// a restart would read.
+dccp::cooling_failure_manager::Result<dccp::cooling_failure_manager::internal::Manifest>
+read_manifest(const std::string& root) {
+  using dccp::cooling_failure_manager::internal::decode_manifest;
+  using dccp::cooling_failure_manager::internal::read_file;
+  const auto bytes =
+      read_file(cfm_store_support::join_path(root, "manifest"),
+                dccp::cooling_failure_manager::limits::kMaxManifestBytes);
+  if (!bytes.has_value()) {
+    return bytes.error();
+  }
+  return decode_manifest(bytes.value());
+}
+
+/// The number of replay records the manifest carries.
+std::size_t replay_records(
+    const dccp::cooling_failure_manager::internal::Manifest& manifest) {
+  return manifest.attempts.size();
+}
 
 using namespace cfm_store_support;
 
@@ -209,16 +232,23 @@ CT_TEST(store_idempotency_retention_evicts_the_oldest_records) {
                                  "m-" + dccp::cooling_failure_manager::to_decimal(index), 1));
   }
   {
+    // The replay window is the committed manifest's, not a directory's.
     const auto info = store.info();
     CT_REQUIRE(info.has_value());
     CT_CHECK_EQ(info.value().idempotency_records, std::size_t{2});
-    CT_CHECK_EQ(list_names(join_path(root, "idem")).size(), std::size_t{2});
+    const auto manifest = read_manifest(root);
+    CT_REQUIRE(manifest.has_value());
+    CT_CHECK_EQ(replay_records(manifest.value()), std::size_t{2});
+    CT_REQUIRE(!manifest.value().attempts.empty());
+    CT_CHECK_EQ(manifest.value().attempts.front().mutation.str(), std::string("m-3"));
+    CT_CHECK(manifest.value().attempts.front().ordinal.value() == 1);
   }
 
-  // The oldest record is gone, so a retry of the first mutation is a NEW
-  // mutation. That is the documented behaviour of a bounded replay window, and
-  // it is exactly why a caller that cannot know the window must use a fresh
-  // identity rather than rely on replay.
+  // The oldest entry has left the window and no longer carries a record, so a
+  // retry of the first mutation is a NEW mutation. That is the documented
+  // behaviour of a bounded replay window, and it is exactly why a caller that
+  // cannot know the window must use a fresh identity rather than rely on
+  // replay.
   PublicationRequest first_again = request_for(empty_state(1), "m-1", 1);
   first_again.epoch = store.epoch();
   first_again.incarnation = store.incarnation();
@@ -239,9 +269,14 @@ CT_TEST(store_idempotency_retention_evicts_the_oldest_records) {
     const auto info = store.info();
     CT_REQUIRE(info.has_value());
     CT_CHECK_EQ(info.value().idempotency_records, std::size_t{2});
-    // The record of the publication that just committed is never evicted, even
-    // at the smallest useful window.
+    // The publication that just committed is inside the window, and the window
+    // still holds exactly two identities.
     CT_CHECK_EQ(info.value().head.value(), std::uint64_t{4});
+    const auto manifest = read_manifest(root);
+    CT_REQUIRE(manifest.has_value());
+    CT_CHECK_EQ(replay_records(manifest.value()), std::size_t{2});
+    CT_REQUIRE(!manifest.value().attempts.empty());
+    CT_CHECK_EQ(manifest.value().attempts.front().mutation.str(), std::string("m-1"));
   }
   CT_CHECK(store.close().has_value());
 }
@@ -293,21 +328,38 @@ CT_TEST(store_attempt_ordinals_may_not_go_backwards) {
   CT_CHECK(store.close().has_value());
 }
 
-CT_TEST(store_idempotency_record_identity_is_not_the_file_name) {
-  // The record name is a digest of the identity, so two identities that share a
-  // prefix cannot collide and no identity can reach the file system.
+CT_TEST(store_replay_identity_is_recorded_exactly_and_cannot_collide) {
+  // The identity a retry is matched on is recorded in the committed manifest as
+  // its exact identifier, so two identities that share a prefix stay distinct and
+  // the match is an equality on the identity rather than on anything derived from
+  // it.
   const std::string root = case_root("idempotency-names");
   Store store = create_fresh(root);
   publish_or_abort(store, request_for(empty_state(1), "mutation", 1));
   publish_or_abort(store, request_for(empty_state(2), "mutation-2", 1));
-  const std::vector<std::string> names = list_names(join_path(root, "idem"));
-  CT_REQUIRE(names.size() == 2);
-  CT_CHECK(names[0] != names[1]);
-  for (const std::string& name : names) {
-    CT_CHECK_EQ(name.size(), std::size_t{69});
-    CT_CHECK_EQ(name.substr(0, 1), std::string("m"));
-    CT_CHECK_EQ(name.substr(65), std::string(".dat"));
-    CT_CHECK(name.find("mutation") == std::string::npos);
+  {
+    const auto manifest = read_manifest(root);
+    CT_REQUIRE(manifest.has_value());
+    CT_REQUIRE(manifest.value().attempts.size() == 2);
+    CT_CHECK_EQ(manifest.value().attempts[0].mutation.str(), std::string("mutation-2"));
+    CT_CHECK_EQ(manifest.value().attempts[1].mutation.str(), std::string("mutation"));
+    CT_CHECK(manifest.value().attempts[0].request_digest !=
+             manifest.value().attempts[1].request_digest);
+  }
+
+  // Each identity replays as itself: neither is answered with the other's result.
+  for (const std::pair<std::string, std::uint64_t>& item :
+       {std::pair<std::string, std::uint64_t>{"mutation", 1},
+        std::pair<std::string, std::uint64_t>{"mutation-2", 2}}) {
+    PublicationRequest retry =
+        request_for(empty_state(item.second), item.first, 1);
+    retry.epoch = WriterEpoch();
+    retry.incarnation = WriterIncarnation();
+    const auto served = store.publish(retry);
+    CT_REQUIRE(served.has_value());
+    CT_CHECK(served.value().replayed);
+    CT_CHECK_EQ(served.value().generation.value(), item.second);
+    CT_CHECK_EQ(served.value().mutation.str(), item.first);
   }
   CT_CHECK(store.close().has_value());
 }

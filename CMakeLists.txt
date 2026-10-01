@@ -12,7 +12,7 @@ cmake_minimum_required(VERSION 3.20)
 # Keep in sync with include/dccp/cooling_failure_manager/version.hpp; the test
 # suite compares this value against the compiled-in library version.
 project(cooling_failure_manager
-        VERSION 1.0.0
+        VERSION 1.0.1
         DESCRIPTION "Generation-bound cooling failure classification, response and recovery authority"
         HOMEPAGE_URL "https://github.com/summonlabs/Cooling-Failure-Manager"
         LANGUAGES CXX)
@@ -172,6 +172,7 @@ if(COOLING_FAILURE_MANAGER_BUILD_TESTS)
     tests/tests_store.cpp
     tests/tests_store_recovery.cpp
     tests/tests_idempotency.cpp
+    tests/tests_replay_durability.cpp
     tests/tests_property.cpp
     tests/tests_adversarial.cpp
     tests/tests_multiprocess.cpp

@@ -10,10 +10,12 @@
 // reference model written in the test rather than against the library's own idea.
 
 #include <algorithm>
+#include <filesystem>
 #include <cstdint>
 #include <map>
 #include <set>
 #include <string>
+#include <system_error>
 #include <string_view>
 #include <vector>
 
@@ -26,15 +28,46 @@
 #include "dccp/cooling_failure_manager/limits.hpp"
 #include "dccp/cooling_failure_manager/model.hpp"
 #include "dccp/cooling_failure_manager/recovery.hpp"
+#include "dccp/cooling_failure_manager/store.hpp"
 #include "dccp/cooling_failure_manager/text.hpp"
 
 #include "test_framework.hpp"
+
+#include "file_ops.hpp"
+#include "store_internal.hpp"
 
 namespace cfm = dccp::cooling_failure_manager;
 
 namespace {
 
 constexpr std::int64_t kPropClock = 2000000000;
+
+/// The committed head manifest as it exists on disk, for the replay state machine.
+cfm::Result<dccp::cooling_failure_manager::internal::Manifest> read_state_machine_manifest(
+    const std::string& root) {
+  using dccp::cooling_failure_manager::internal::decode_manifest;
+  using dccp::cooling_failure_manager::internal::read_file;
+  const auto bytes = read_file(
+      (std::filesystem::path(root) / "manifest").string(),
+      cfm::limits::kMaxManifestBytes);
+  if (!bytes.has_value()) {
+    return bytes.error();
+  }
+  return decode_manifest(bytes.value());
+}
+
+/// A minimal but structurally valid state for the store's randomized replay
+/// state machine: one loop scope and no evidence, so the body is a pure function
+/// of the clock and two bodies with the same clock have the same intent digest.
+cfm::Result<cfm::CoolingFailureState> property_store_body(std::int64_t clock) {
+  cfm::CoolingFailureState state;
+  state.evaluated_at = cfm::DecisionClock(clock);
+  cfm::CoolingScope scope;
+  scope.id = *cfm::ScopeId::parse("prop.store.loop");
+  scope.kind = cfm::ScopeKind::Loop;
+  state.scopes.push_back(scope);
+  return state;
+}
 constexpr std::int64_t kPropWindow = 60000;
 
 /// The reference model of the identifier grammar. It is written independently of
@@ -136,6 +169,265 @@ cfm::Observation make_scalar(std::size_t index, cfm::ObservationChannel channel,
   observation.sensor = std::string(producer) + ".sensor";
   observation.evidence_generation = cfm::EvidenceGeneration(1);
   return observation;
+}
+
+
+// ===========================================================================
+
+// ===========================================================================
+// Randomized replay state machine
+// ===========================================================================
+
+CT_TEST(property_replay_state_machine_is_exactly_once) {
+  // A randomized sequence of publications, retries and conflicting retries over
+  // one store, checked after every operation against a reference model of the
+  // replay window.
+  //
+  // The model keeps the newest accepted publication of every identity. An identity
+  // is inside the window while the generation its record names is one of the
+  // newest window generations the store still retains, which is what the manifest
+  // claims: an attempt is replayable while the state it committed is still
+  // readable.
+  //
+  // The invariants: an identity inside the window is answered with its committed
+  // result and publishes nothing; a different intent inside the window is refused
+  // without publishing; an identity outside the window is a new mutation under a
+  // strictly greater ordinal, because the ordinal rule still remembers it; and the
+  // head never moves by more than one generation in one operation.
+  using dccp::cooling_failure_manager::MutationId;
+  using dccp::cooling_failure_manager::PublicationRequest;
+  using dccp::cooling_failure_manager::Store;
+  using dccp::cooling_failure_manager::StoreId;
+  using dccp::cooling_failure_manager::StoreOptions;
+  using dccp::cooling_failure_manager::WriterEpoch;
+  using dccp::cooling_failure_manager::WriterIncarnation;
+
+  const std::string directory =
+      (std::filesystem::current_path() / "property-replay-state-machine").string();
+  std::error_code ignored;
+  std::filesystem::remove_all(directory, ignored);
+  std::filesystem::create_directories(directory, ignored);
+
+  ct_test::Rng rng(ct_test::case_seed("property_replay_state_machine_is_exactly_once"));
+  const std::size_t window = 3;
+  StoreOptions options;
+  options.root = directory;
+  options.idempotency_retention = window;
+  options.retained_generations = window;
+  auto created = Store::create(options, *StoreId::parse("prop.store"));
+  CT_REQUIRE(created.has_value());
+  Store store = std::move(created).value();
+
+  /// The newest accepted publication of one identity.
+  struct Accepted {
+    std::string mutation;
+    std::uint32_t ordinal = 0;
+    std::int64_t clock = 0;
+    std::uint64_t generation = 0;
+  };
+  std::vector<Accepted> accepted;
+
+  const auto find_accepted = [&](const std::string& mutation) -> const Accepted* {
+    for (const Accepted& item : accepted) {
+      if (item.mutation == mutation) {
+        return &item;
+      }
+    }
+    return nullptr;
+  };
+  /// An identity is inside the window while its record's generation is one of the
+  /// newest window generations, which is the store's retention of the state the
+  /// record names.
+  const auto in_window = [&](const std::string& mutation) {
+    const Accepted* item = find_accepted(mutation);
+    if (item == nullptr || item->generation == 0) {
+      return false;
+    }
+    for (const Accepted& other : accepted) {
+      if (other.generation > item->generation &&
+          other.generation - item->generation >= window) {
+        return false;
+      }
+    }
+    // At most window - 1 generations may be strictly newer for the record to
+    // still be inside the newest window publications.
+    std::size_t strictly_newer = 0;
+    for (const Accepted& other : accepted) {
+      if (other.generation > item->generation) {
+        ++strictly_newer;
+      }
+    }
+    return strictly_newer < window;
+  };
+
+  const std::uint32_t operations = 120;
+  for (std::uint32_t step = 0; step < operations; ++step) {
+    const std::uint32_t choice = rng.below(4);
+    const std::int64_t clock = static_cast<std::int64_t>(step) + 1;
+    // A fresh store has no head yet; generation 0 is the baseline the first
+    // publication moves away from.
+    const auto before = store.head();
+    const std::uint64_t head_before =
+        before.has_value() ? before.value().generation.value() : 0;
+
+    if (choice == 0 || accepted.empty()) {
+      const std::string mutation = "prop.m." + cfm::to_decimal(static_cast<std::uint64_t>(step));
+      PublicationRequest request;
+      request.epoch = store.epoch();
+      request.incarnation = store.incarnation();
+      request.mutation = *MutationId::parse(mutation);
+      request.attempt = *cfm::AttemptOrdinal::parse(1);
+      const auto body = property_store_body(clock);
+      CT_REQUIRE(body.has_value());
+      request.body = body.value();
+      const auto receipt = store.publish(request);
+      CT_REQUIRE(receipt.has_value());
+      CT_CHECK(!receipt.value().replayed);
+      CT_CHECK_EQ(receipt.value().generation.value(), head_before + 1);
+      Accepted record;
+      record.mutation = mutation;
+      record.ordinal = 1;
+      record.clock = clock;
+      record.generation = receipt.value().generation.value();
+      accepted.push_back(record);
+      continue;
+    }
+
+    const std::size_t index =
+        static_cast<std::size_t>(rng.below(static_cast<std::uint32_t>(accepted.size())));
+    const Accepted target = accepted[index];
+
+    if (choice == 1 || choice == 2) {
+      const auto body = property_store_body(target.clock);
+      CT_REQUIRE(body.has_value());
+      if (in_window(target.mutation)) {
+        PublicationRequest request;
+        request.epoch = WriterEpoch();
+        request.incarnation = WriterIncarnation();
+        request.mutation = *MutationId::parse(target.mutation);
+        request.attempt = *cfm::AttemptOrdinal::parse(target.ordinal);
+        request.body = body.value();
+        const auto receipt = store.publish(request);
+        if (!receipt.has_value()) {
+          ct_test::report_note("replay refused at step " +
+                               cfm::to_decimal(static_cast<std::uint64_t>(step)) + " for " +
+                               target.mutation + "#" +
+                               cfm::to_decimal(static_cast<std::uint64_t>(target.ordinal)) + ": " +
+                               receipt.error().to_string());
+        }
+        CT_REQUIRE(receipt.has_value());
+        CT_CHECK_MSG(receipt.value().replayed,
+                     "an identity inside the window was not replayed at step " +
+                         cfm::to_decimal(static_cast<std::uint64_t>(step)));
+        CT_CHECK_EQ(receipt.value().generation.value(), target.generation);
+        CT_CHECK_EQ(receipt.value().head_after.value(), head_before);
+      } else {
+        std::uint32_t next_ordinal = target.ordinal + 1;
+        PublicationRequest request;
+        request.epoch = WriterEpoch();
+        request.incarnation = WriterIncarnation();
+        request.mutation = *MutationId::parse(target.mutation);
+        request.attempt = *cfm::AttemptOrdinal::parse(next_ordinal);
+        request.body = body.value();
+        const auto receipt = store.publish(request);
+        if (!receipt.has_value()) {
+          ct_test::report_note("new mutation refused at step " +
+                               cfm::to_decimal(static_cast<std::uint64_t>(step)) + " for " +
+                               target.mutation + "#" +
+                               cfm::to_decimal(static_cast<std::uint64_t>(next_ordinal)) + ": " +
+                               receipt.error().to_string());
+        }
+        CT_REQUIRE(receipt.has_value());
+        CT_CHECK_MSG(!receipt.value().replayed,
+                     "an identity outside the window was replayed at step " +
+                         cfm::to_decimal(static_cast<std::uint64_t>(step)));
+        CT_CHECK_EQ(receipt.value().generation.value(), head_before + 1);
+        for (Accepted& item : accepted) {
+          if (item.mutation == target.mutation) {
+            item.ordinal = next_ordinal;
+            item.generation = receipt.value().generation.value();
+          }
+        }
+      }
+    } else {
+      // A different intent under an identity the window still carries is refused.
+      const auto body = property_store_body(target.clock + 900000);
+      CT_REQUIRE(body.has_value());
+      if (in_window(target.mutation)) {
+        PublicationRequest request;
+        request.epoch = WriterEpoch();
+        request.incarnation = WriterIncarnation();
+        request.mutation = *MutationId::parse(target.mutation);
+        request.attempt = *cfm::AttemptOrdinal::parse(target.ordinal);
+        request.body = body.value();
+        const auto refused = store.publish(request);
+        CT_REQUIRE(!refused.has_value());
+        CT_CHECK_EQ(refused.error().code(), cfm::ErrorCode::IdempotencyConflict);
+      }
+    }
+
+    // The head moved by at most one generation and never backwards.
+    const auto after = store.head();
+    CT_REQUIRE(after.has_value());
+    CT_CHECK_MSG(after.value().generation.value() == head_before ||
+                     after.value().generation.value() == head_before + 1,
+                 "the head moved by more than one generation at step " +
+                     cfm::to_decimal(static_cast<std::uint64_t>(step)));
+
+    // Every reopen answers the same retry the same way.
+    if (step % 20 == 19) {
+      CT_REQUIRE(store.close().has_value());
+      auto reopened = Store::open(options);
+      CT_REQUIRE(reopened.has_value());
+      store = std::move(reopened).value();
+      const auto again = store.head();
+      CT_REQUIRE(again.has_value());
+      CT_CHECK_EQ(again.value().generation.value(), after.value().generation.value());
+    }
+  }
+  const auto report = store.verify();
+  CT_REQUIRE(report.has_value());
+  if (!report.value().ok()) {
+    std::string detail = "verify findings:";
+    for (const auto& finding : report.value().findings) {
+      detail += " [" + finding.code + "] " + finding.subject + " |";
+    }
+    ct_test::report_note(detail);
+  }
+  CT_CHECK_MSG(report.value().head_verified, "the store did not verify after the state machine");
+  CT_CHECK(store.close().has_value());
+
+  // Every identity inside the final window still replays, after everything above.
+  auto opened = Store::open(options);
+  CT_REQUIRE(opened.has_value());
+  Store final_store = std::move(opened).value();
+  std::size_t checked = 0;
+  for (const Accepted& target : accepted) {
+    if (!in_window(target.mutation)) {
+      continue;
+    }
+    PublicationRequest request;
+    request.epoch = WriterEpoch();
+    request.incarnation = WriterIncarnation();
+    request.mutation = *MutationId::parse(target.mutation);
+    request.attempt = *cfm::AttemptOrdinal::parse(target.ordinal);
+    const auto body = property_store_body(target.clock);
+    CT_REQUIRE(body.has_value());
+    request.body = body.value();
+    const auto receipt = final_store.publish(request);
+    if (!receipt.has_value()) {
+      ct_test::report_note("final replay refused for " + target.mutation + "#" +
+                           cfm::to_decimal(static_cast<std::uint64_t>(target.ordinal)) + ": " +
+                           receipt.error().to_string());
+    }
+    CT_REQUIRE(receipt.has_value());
+    CT_CHECK_MSG(receipt.value().replayed,
+                 "an identity in the final window was not replayed: " + target.mutation);
+    CT_CHECK_EQ(receipt.value().generation.value(), target.generation);
+    ++checked;
+  }
+  CT_CHECK(checked > 0);
+  CT_CHECK(final_store.close().has_value());
 }
 
 }  // namespace

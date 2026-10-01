@@ -1555,8 +1555,8 @@ CT_TEST(test_result_value_throws_only_on_programmer_error) {
 // ---------------------------------------------------------------------------
 
 CT_TEST(test_version_agreement) {
-  CT_CHECK_EQ(std::string(version_string()), std::string("1.0.0"));
-  CT_CHECK_EQ(std::string(component_id()), std::string("dccp-cooling-failure-manager/1.0.0"));
+  CT_CHECK_EQ(std::string(version_string()), std::string("1.0.1"));
+  CT_CHECK_EQ(std::string(component_id()), std::string("dccp-cooling-failure-manager/1.0.1"));
   CT_CHECK(!systems_boundary().empty());
   CT_CHECK_EQ(std::string(version_string()),
               std::to_string(kVersionMajor) + "." + std::to_string(kVersionMinor) + "." +

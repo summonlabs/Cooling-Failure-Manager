@@ -3,7 +3,7 @@
 Generation-bound cooling-failure classification, response-plan and recovery-gate
 authority over synthetic cooling evidence. This is DCCP boundary 54.
 
-**Cooling Failure Manager 1.0.0** answers one question:
+**Cooling Failure Manager 1.0.1** answers one question:
 
 > Given current cooling and thermal failure evidence and the service obligations
 > of the affected scopes, what cooling failure state is authoritative, which
@@ -398,7 +398,12 @@ ordinal. Repeating the pair with the same content returns the recorded outcome
 and writes nothing; repeating it with different content is an
 **IdempotencyConflict**. A replay is resolved *before* the authority fence, which
 is what makes a lost response safe: a caller that retries an operation that was
-already committed is told so instead of being forced to plan it again.
+already committed is told so instead of being forced to plan it again. The
+accepted-attempt record travels inside the committed manifest entry that carries
+the publication, so the mutation and the identity that makes its retry a replay
+become durable together, at the single commit point, through one atomic
+directory-entry replacement. There is no step after the commit point that a retry
+depends on.
 
 Retention is bounded. An attempt whose record has been evicted is no longer
 recognisable as a replay, and the next request that reuses its identity is
@@ -630,11 +635,14 @@ determined local attacker.**
 - **One decision clock per evaluation.** A scenario evaluated over a long window
   must be re-evaluated with a later clock; the library does not interpolate.
 - **Retention is bounded and eviction is documented.** An idempotent replay is
-  guaranteed only while its accepted-attempt record is retained.
-- **The idempotency record is written immediately after the commit point.** A
-  crash in that window leaves a committed publication whose retry is treated as a
-  new mutation. The window is kept as small as the protocol allows and is
-  documented in docs/FORMATS.md.
+  guaranteed, across any crash boundary and any number of restarts, while the
+  generation the accepted attempt committed is retained.
+- **The replay window is bounded by the store's retention settings.** An accepted
+  mutation stays replayable while the generation it committed is still retained,
+  and for at most min(retained_generations, idempotency_retention) publications.
+  Outside that window a retry is a new mutation, and the ordinal rule still
+  refuses a reused identity whose ordinal has gone backwards. A caller that cannot
+  know the window must use a fresh identity rather than rely on replay.
 - **Attribution uses the maximum share over the dependency paths it finds.** A
   dependency declared with a share of zero does not carry cooling and is not
   traversed, and a scope reached by several paths keeps the strongest.
@@ -661,7 +669,7 @@ include/dccp/cooling_failure_manager/   the public API, 14 headers
   store.hpp         the durable store
   text.hpp digest.hpp version.hpp
 src/                  the implementation, 18 translation units
-tests/                233 cases, including real multi-process and crash tests
+tests/                244 cases, including real multi-process and crash tests
 examples/             five complete programs
 benchmarks/           measured throughput with provenance on every line
 tools/cfmctl/         the inspection and evaluation tool
@@ -670,7 +678,7 @@ docs/FORMATS.md       the byte-level format and store protocol contract
 
 ## Testing
 
-233 cases, no timeouts and no sleeps in the framework, deterministic under a
+244 cases, no timeouts and no sleeps in the framework, deterministic under a
 seed:
 
 ```sh
@@ -756,11 +764,25 @@ whatever they find:
   analyzer inflates through inlined error construction. Neither is a defect, and
   neither is suppressed.
 - **AddressSanitizer** (`-DCOOLING_FAILURE_MANAGER_ENABLE_ASAN=ON`) runs the
-  whole 233-case suite. It found one real defect during validation: a test macro
+  whole 244-case suite. It found one real defect during validation: a test macro
   bound a reference to a value held inside a temporary `Result`, which left the
   reference dangling after the temporary died. The macro now compares by value.
 - **`/W4 /WX`** on MSVC for the library, the tool, the examples, the benchmarks
   and the whole test suite, with zero warnings.
+
+### Crash-atomic replay
+
+A publication's accepted-attempt record is part of the manifest that commits it,
+so the mutation and the identity that makes its retry a replay become durable
+together, at the single commit point, through one atomic directory-entry
+replacement. Nothing a retry depends on is written after that point. The suite
+proves it with real child processes killed at twelve publication boundaries,
+including the atomic replacement itself and the point at which a separate
+idempotency record used to be written: at every boundary before the replacement
+the retry performs exactly one mutation, and at every boundary from the
+replacement onwards it replays the committed result, advances no generation,
+adds no accepted attempt and changes no authoritative digest. The recovered store
+is then reopened a second time and verified again.
 
 ---
 

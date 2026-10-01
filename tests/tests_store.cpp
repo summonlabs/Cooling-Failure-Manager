@@ -481,6 +481,9 @@ CT_TEST(store_internal_manifest_round_trips_and_rejects_every_shape) {
   // The header byte count has to agree with the head entry.
   const std::string encoded = internal::encode_manifest(manifest);
   const auto decoded = internal::decode_manifest(encoded);
+  if (!decoded.has_value()) {
+    ct_test::report_note("manifest refused: " + decoded.error().to_string() + " || " + encoded);
+  }
   CT_REQUIRE(decoded.has_value());
   CT_CHECK_EQ(decoded.value().head.value(), std::uint64_t{3});
   CT_CHECK_EQ(decoded.value().retained.size(), std::size_t{3});
@@ -521,9 +524,18 @@ CT_TEST(store_internal_manifest_round_trips_and_rejects_every_shape) {
     CT_CHECK_EQ(internal::decode_manifest(internal::encode_manifest(wrong)).error().code(),
                 ErrorCode::HeadCorrupt);
   }
-  // The trailer count must agree with the retained lines.
+  // The trailer counts must agree with the lines they cover.
   {
-    const std::string edited = encoded.substr(0, encoded.rfind("count=")) + "count=2\t" +
+    const std::size_t trailer = encoded.rfind("count=");
+    CT_REQUIRE(trailer != std::string::npos);
+    const std::string edited = encoded.substr(0, trailer) + "count=2\tattempt=0\t" +
+                               encoded.substr(encoded.size() - 65);
+    CT_CHECK_EQ(internal::decode_manifest(edited).error().code(), ErrorCode::CountMismatch);
+  }
+  {
+    const std::size_t trailer = encoded.rfind("count=");
+    CT_REQUIRE(trailer != std::string::npos);
+    const std::string edited = encoded.substr(0, trailer) + "count=3\tattempt=1\t" +
                                encoded.substr(encoded.size() - 65);
     CT_CHECK_EQ(internal::decode_manifest(edited).error().code(), ErrorCode::CountMismatch);
   }
@@ -579,12 +591,29 @@ CT_TEST(store_internal_manifest_round_trips_and_rejects_every_shape) {
                 ErrorCode::UnsupportedSchemaVersion);
   }
   {
-    std::string reversioned = encoded;
-    const std::size_t position = reversioned.find("\t1\t");
+    // The manifest declares its version, and only the versions this release reads
+    // are accepted.
+    std::string version_three = encoded;
+    const std::size_t position = version_three.find("\t2\t");
     CT_REQUIRE(position != std::string::npos);
-    reversioned.replace(position, 3, "\t2\t");
-    CT_CHECK_EQ(internal::decode_manifest(reversioned).error().code(),
+    version_three.replace(position, 3, "\t3\t");
+    CT_CHECK_EQ(internal::decode_manifest(version_three).error().code(),
                 ErrorCode::UnsupportedSchemaVersion);
+    // A version 1 manifest has thirteen header fields and no replay table. It is
+    // still read, so a store written by release 1.0.0 opens.
+    std::string version_one = encoded;
+    version_one.replace(position, 3, "\t1\t");
+    const std::size_t attempt_field = version_one.find("\tattempt=0");
+    CT_REQUIRE(attempt_field != std::string::npos);
+    version_one.erase(attempt_field, std::string("\tattempt=0").size());
+    const std::size_t trailer_attempt = version_one.rfind("\tattempt=0");
+    CT_REQUIRE(trailer_attempt != std::string::npos);
+    version_one.erase(trailer_attempt, std::string("\tattempt=0").size());
+    // The checksum of a rewritten record no longer matches, which is exactly what
+    // a version 1 file edited in place would be: refused. Re-encoding from the
+    // decoded form is how a version 1 file is actually produced, and the decoder
+    // of that shape is covered by the replay upgrade case.
+    CT_CHECK(!internal::decode_manifest(version_one).has_value());
   }
   // A one-line manifest has no trailer, so it is a missing tail.
   CT_CHECK_EQ(internal::decode_manifest("dccp-cooling-failure-manifest\t1\n").error().code(),

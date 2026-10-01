@@ -18,6 +18,18 @@
 
 namespace dccp::cooling_failure_manager::internal {
 
+/// One accepted-attempt record: the identity of a mutation, the digest of the
+/// intent it carried, and the committed result a retry of it must be answered
+/// with.
+struct AttemptRecord {
+  MutationId mutation;
+  AttemptOrdinal ordinal;
+  Digest request_digest{};
+  StateGeneration generation{};
+  Digest digest{};
+  CommitSequence commit{};
+};
+
 /// One retained-generation entry of a head manifest.
 struct ManifestEntry {
   StateGeneration generation{};
@@ -42,6 +54,22 @@ struct Manifest {
   std::uint64_t bytes = 0;
   /// Newest first; entries[0] is the head.
   std::vector<ManifestEntry> retained;
+  /// The replay records this authority carries, newest generation first, at most
+  /// one per identity and at most one per retained generation.
+  ///
+  /// They travel inside the manifest rather than in a file or a per-entry field
+  /// because the durable replacement of the manifest is the single commit point
+  /// of a publication: a record written after that point could be lost by a crash
+  /// while the mutation it describes stayed committed, which is exactly the state
+  /// in which a lost-response retry would be mistaken for a new mutation. Inside
+  /// the manifest there is no such window - a committed mutation and the identity
+  /// that makes its retry a replay become visible together or not at all.
+  ///
+  /// The table is rebuilt from scratch on every publication from the records the
+  /// previous manifest carried plus the record of the publication itself, so it
+  /// never depends on which entries happen to be retained and can never lose an
+  /// identity that is still inside the window.
+  std::vector<AttemptRecord> attempts;
 };
 
 std::string encode_floor(StateGeneration floor, CommitSequence count);
@@ -71,16 +99,6 @@ std::string generation_file_name(StateGeneration generation);
 /// The state generation named by a generation file name, or an error when the
 /// name is not a canonical generation name.
 Result<StateGeneration> parse_generation_file_name(std::string_view name);
-
-/// One accepted-attempt record.
-struct AttemptRecord {
-  MutationId mutation;
-  AttemptOrdinal ordinal;
-  Digest request_digest{};
-  StateGeneration generation{};
-  Digest digest{};
-  CommitSequence commit{};
-};
 
 std::string encode_attempt_record(const AttemptRecord& record);
 Result<AttemptRecord> decode_attempt_record(std::string_view text);
