@@ -1,0 +1,25 @@
+@PACKAGE_INIT@
+
+# Cooling Failure Manager - DCCP boundary 54 (Cooling Infrastructure Control).
+#
+# Exported target:
+#   dccp::cooling_failure_manager       C++20 library
+#
+# Example:
+#   find_package(cooling_failure_manager 1.0 REQUIRED)
+#   target_link_libraries(app PRIVATE dccp::cooling_failure_manager)
+
+include(CMakeFindDependencyMacro)
+
+include("${CMAKE_CURRENT_LIST_DIR}/cooling_failure_managerTargets.cmake")
+
+set(COOLING_FAILURE_MANAGER_LIBRARIES dccp::cooling_failure_manager)
+set(COOLING_FAILURE_MANAGER_INCLUDE_DIRS "${PACKAGE_PREFIX_DIR}/${CMAKE_INSTALL_INCLUDEDIR}")
+
+if(NOT TARGET dccp::cooling_failure_manager)
+  set(cooling_failure_manager_FOUND FALSE)
+  set(cooling_failure_manager_NOT_FOUND_MESSAGE "the cooling_failure_manager export set did not provide dccp::cooling_failure_manager")
+  return()
+endif()
+
+check_required_components(cooling_failure_manager)

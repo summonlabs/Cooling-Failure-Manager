@@ -1,0 +1,23 @@
+# Normalize line endings for text, keep binaries untouched.
+* text=auto
+
+*.cpp   text eol=lf
+*.hpp   text eol=lf
+*.c     text eol=lf
+*.h     text eol=lf
+*.txt   text eol=lf
+*.cmake text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+
+CMakeLists.txt text eol=lf
+*.cmake.in     text eol=lf
+
+# Repository metadata and notices are text as well, and are pinned to LF so a
+# checkout is byte-identical on every platform.
+.gitattributes text eol=lf
+.gitignore     text eol=lf
+LICENSE        text eol=lf
+NOTICE         text eol=lf
+
+*.bin    binary
