@@ -1,7 +1,7 @@
 # Cooling Failure Manager
 
 Generation-bound cooling-failure classification, response-plan and recovery-gate
-authority over synthetic cooling evidence. This is DCCP boundary 54.
+authority over synthetic cooling evidence.
 
 **Cooling Failure Manager 1.0.1** answers one question:
 
