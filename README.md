@@ -94,7 +94,7 @@ missing. It never touches cooling equipment.
 - **No workload scheduling or placement.** It may request that load be reduced;
   the owner of placement decides what that means.
 - **No generic incident or recovery lifecycle.** Those belong to Incident State
-  Fabric and Recovery Coordinator. This library owns the cooling-specific gates.
+  Fabric and [Recovery Coordinator](https://github.com/summonlabs/Recovery-Coordinator). This library owns the cooling-specific gates.
 
 ## The five facts that stay separate
 
