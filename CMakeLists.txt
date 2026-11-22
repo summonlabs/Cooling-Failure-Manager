@@ -204,11 +204,30 @@ if(COOLING_FAILURE_MANAGER_BUILD_TESTS)
   set_tests_properties(cooling_failure_manager_install_package PROPERTIES
     FIXTURES_SETUP cooling_failure_manager_package)
 
+  # The consumer is built in the configuration of this build, with its generator
+  # and compiler, and a library built with the sanitizer links only into a
+  # consumer built with it, so the consumer is given the same sanitizer flags.
+  set(COOLING_FAILURE_MANAGER_CONSUMER_FLAG_ARGUMENTS)
+  if(COOLING_FAILURE_MANAGER_ENABLE_ASAN)
+    if(MSVC)
+      list(APPEND COOLING_FAILURE_MANAGER_CONSUMER_FLAG_ARGUMENTS
+           "-DCONSUMER_CXX_FLAGS=/fsanitize=address /Zi"
+           "-DCONSUMER_LINK_FLAGS=/INCREMENTAL:NO /DEBUG")
+    else()
+      list(APPEND COOLING_FAILURE_MANAGER_CONSUMER_FLAG_ARGUMENTS
+           "-DCONSUMER_CXX_FLAGS=-fsanitize=address -fno-omit-frame-pointer"
+           "-DCONSUMER_LINK_FLAGS=-fsanitize=address -fno-omit-frame-pointer")
+    endif()
+  endif()
   add_test(NAME cooling_failure_manager_downstream_consumer
     COMMAND ${CMAKE_COMMAND}
       -DCONSUMER_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests/downstream
       -DCONSUMER_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}/downstream-build
       -DCONSUMER_PREFIX=${COOLING_FAILURE_MANAGER_PACKAGE_PREFIX}
+      -DCONSUMER_CONFIG=$<CONFIG>
+      "-DCONSUMER_GENERATOR=${CMAKE_GENERATOR}"
+      "-DCONSUMER_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+      ${COOLING_FAILURE_MANAGER_CONSUMER_FLAG_ARGUMENTS}
       -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/run_downstream_consumer.cmake)
   set_tests_properties(cooling_failure_manager_downstream_consumer PROPERTIES
     FIXTURES_REQUIRED cooling_failure_manager_package)

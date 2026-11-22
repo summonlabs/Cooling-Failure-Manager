@@ -16,12 +16,36 @@ endif()
 
 file(REMOVE_RECURSE "${CONSUMER_BINARY_DIR}")
 
+# The consumer is built the way the library under test was built: the same
+# configuration (a Release consumer does not link against a Debug library), the
+# same generator and compiler, and the sanitizer flags when the library has
+# them. The per-configuration link flags come last on the link line, so that is
+# where a flag such as /INCREMENTAL:NO has to go to take effect.
+if(NOT DEFINED CONSUMER_CONFIG OR CONSUMER_CONFIG STREQUAL "")
+  set(CONSUMER_CONFIG Release)
+endif()
+set(configure_command "${CMAKE_COMMAND}"
+    -S "${CONSUMER_SOURCE_DIR}"
+    -B "${CONSUMER_BINARY_DIR}"
+    "-DCMAKE_BUILD_TYPE=${CONSUMER_CONFIG}"
+    "-DCMAKE_PREFIX_PATH=${CONSUMER_PREFIX}")
+if(DEFINED CONSUMER_GENERATOR AND NOT CONSUMER_GENERATOR STREQUAL "")
+  list(APPEND configure_command -G "${CONSUMER_GENERATOR}")
+endif()
+if(DEFINED CONSUMER_CXX_COMPILER AND NOT CONSUMER_CXX_COMPILER STREQUAL "")
+  list(APPEND configure_command "-DCMAKE_CXX_COMPILER=${CONSUMER_CXX_COMPILER}")
+endif()
+if(DEFINED CONSUMER_CXX_FLAGS AND NOT CONSUMER_CXX_FLAGS STREQUAL "")
+  list(APPEND configure_command "-DCMAKE_CXX_FLAGS_INIT=${CONSUMER_CXX_FLAGS}")
+endif()
+if(DEFINED CONSUMER_LINK_FLAGS AND NOT CONSUMER_LINK_FLAGS STREQUAL "")
+  string(TOUPPER "${CONSUMER_CONFIG}" consumer_config_upper)
+  list(APPEND configure_command
+       "-DCMAKE_EXE_LINKER_FLAGS_${consumer_config_upper}=${CONSUMER_LINK_FLAGS}")
+endif()
+
 execute_process(
-  COMMAND "${CMAKE_COMMAND}"
-          -S "${CONSUMER_SOURCE_DIR}"
-          -B "${CONSUMER_BINARY_DIR}"
-          -DCMAKE_BUILD_TYPE=Release
-          -DCMAKE_PREFIX_PATH=${CONSUMER_PREFIX}
+  COMMAND ${configure_command}
   RESULT_VARIABLE configure_result
   OUTPUT_VARIABLE configure_output
   ERROR_VARIABLE configure_error)
@@ -30,7 +54,7 @@ if(NOT configure_result EQUAL 0)
 endif()
 
 execute_process(
-  COMMAND "${CMAKE_COMMAND}" --build "${CONSUMER_BINARY_DIR}" --config Release
+  COMMAND "${CMAKE_COMMAND}" --build "${CONSUMER_BINARY_DIR}" --config "${CONSUMER_CONFIG}"
   RESULT_VARIABLE build_result
   OUTPUT_VARIABLE build_output
   ERROR_VARIABLE build_error)

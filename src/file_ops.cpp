@@ -1247,13 +1247,28 @@ Result<void> atomic_replace(const std::string& target, const std::string& staged
     // a directory entry change; there is no directory fsync to call later.
     flags |= MOVEFILE_WRITE_THROUGH;
   }
-  if (MoveFileExW(wide_staged.c_str(), wide_target.c_str(), flags) == 0) {
+  // While a reader has the target open (an inspection, a backup, an antivirus
+  // or indexing scan) the replacement fails until the reader closes it, so it
+  // is retried for a bounded time (about 2 s). A directory or a read-only file
+  // in the way is not transient and fails at once.
+  for (int attempt = 0;; ++attempt) {
+    if (MoveFileExW(wide_staged.c_str(), wide_target.c_str(), flags) != 0) {
+      return ok();
+    }
     const DWORD error = GetLastError();
-    return Error(ErrorCode::IoError, windows_error_text("MoveFileEx", error))
-        .with_subject(target)
-        .with_detail("staged=" + staged);
+    const DWORD attributes = GetFileAttributesW(wide_target.c_str());
+    const bool blocked = attributes != INVALID_FILE_ATTRIBUTES &&
+                         (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY)) != 0;
+    const bool transient = (error == ERROR_ACCESS_DENIED || error == ERROR_SHARING_VIOLATION ||
+                            error == ERROR_LOCK_VIOLATION) &&
+                           !blocked;
+    if (!transient || attempt >= 100) {
+      return Error(ErrorCode::IoError, windows_error_text("MoveFileEx", error))
+          .with_subject(target)
+          .with_detail("staged=" + staged);
+    }
+    Sleep(20);
   }
-  return ok();
 #else
   if (rename(staged.c_str(), target.c_str()) != 0) {
     const int error = errno;

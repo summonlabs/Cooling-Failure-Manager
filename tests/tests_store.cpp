@@ -17,6 +17,7 @@
 #include "test_framework.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -25,6 +26,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -944,6 +946,43 @@ CT_TEST(store_publish_assigns_generations_and_chains_parents) {
   CT_CHECK_EQ(store.load(StateGeneration(0)).error().code(), ErrorCode::GenerationNotRetained);
   CT_CHECK_EQ(store.load(StateGeneration(4)).error().code(), ErrorCode::GenerationNotRetained);
   CT_CHECK(store.close().has_value());
+}
+
+// A publication replaces the head manifest. A reader has the manifest open for a
+// moment (an inspection, a backup, a scan) while it is replaced.
+CT_TEST(store_publish_waits_for_a_reader_of_the_head_manifest) {
+  const std::string root = case_root("publish-manifest-reader");
+  Store store = create_fresh(root);
+  (void)publish_or_abort(store, request_for(empty_state(10), "m-reader-1", 1));
+
+  PublicationRequest request = request_for(empty_state(20), "m-reader-2", 1);
+  request.epoch = store.epoch();
+  request.incarnation = store.incarnation();
+
+  std::ifstream reader(join_path(root, "manifest"), std::ios::binary);
+  const bool reader_open = static_cast<bool>(reader);
+  std::thread release([&reader] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    reader.close();
+  });
+  const auto receipt = store.publish(request);
+  release.join();
+  CT_CHECK(reader_open);
+  CT_REQUIRE(receipt.has_value());
+  CT_CHECK_EQ(receipt.value().generation.value(), std::uint64_t{2});
+  CT_CHECK(receipt.value().head_after == receipt.value().generation);
+
+  const auto info = store.info();
+  CT_REQUIRE(info.has_value());
+  CT_CHECK_EQ(info.value().head.value(), std::uint64_t{2});
+  CT_CHECK_EQ(info.value().commit_sequence.value(), std::uint64_t{2});
+  CT_CHECK(store.close().has_value());
+
+  Store reopened = open_writer(root);
+  const auto head = reopened.head();
+  CT_REQUIRE(head.has_value());
+  CT_CHECK_EQ(head.value().generation.value(), std::uint64_t{2});
+  CT_CHECK(reopened.close().has_value());
 }
 
 CT_TEST(store_publish_reports_durable_only_with_a_successful_flush) {
